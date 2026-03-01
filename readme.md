@@ -1,273 +1,198 @@
 # Project Divergence
 
-Project Divergence is a hardware-native, resource-scheduled retrieval engine for vector and hybrid search workloads.
+Project Divergence is a single-node, NVMe-native retrieval engine designed for high-throughput, low-latency vector search.
 
-It is built on a single principle:
+It focuses on one goal:
 
-Retrieval is not a fixed index operation.  
-It is a planned execution over a graph of heterogeneous hardware resources.
+Fully utilize modern NVMe SSDs and CPU cores without relying on mmap or OS page cache.
 
-Divergence treats storage, memory, compute, and network as schedulable resource clouds.  
-It provides predictable latency, multi-tenant isolation, and a continuous performance-to-cost spectrum without binding the system to a single ANN structure.
+The system is designed around explicit buffer management, asynchronous IO scheduling, and record-level tiering to achieve predictable tail latency under memory constraints.
 
 ---
 
 ## Motivation
 
-Modern vector databases typically assume:
+Recent research shows:
 
-- A static global index structure
-- A dominant storage tier
-- OS page cache as implicit caching policy
-- One primary execution strategy
+- CPU is often the bottleneck in SSD-based vector search.
+- NVMe bandwidth is severely underutilized in existing systems.
+- Page-level caching mismatches vector access patterns.
+- Record-level tiering significantly improves performance under skew.
+- Two-stage search (compressed first, exact refine later) is consistently effective.
 
-These assumptions break under:
+Most existing systems still rely on:
 
-- Shifting data distributions
-- Heterogeneous hardware fleets
-- Multi-tenant interference
-- Strict latency targets
-- Cost-sensitive deployments
+- mmap and implicit OS page cache
+- page-granularity buffer management
+- fixed index traversal strategies
+- limited IO scheduling control
 
-Project Divergence is designed for dynamic environments where:
-
-- Data layout evolves
-- Hardware capacity changes
-- Tenants have distinct resource budgets
-- Performance and cost must be explicitly controlled
+Project Divergence is built to address these issues directly.
 
 ---
 
-## Core Principles
+## Design Goals
 
-### 1. Hardware as Resource Clouds
-
-Each hardware type is modeled as a resource cloud defined by measurable properties:
-
-- Latency
-- Bandwidth
-- Concurrency capacity
-- Cost characteristics
-- Isolation capability
-
-Examples include:
-
-- CPU Cloud
-- DRAM Cloud
-- NVMe Cloud
-- Remote Block Storage Cloud
-- Object Storage Cloud
-- GPU Cloud
-- Network Cloud
-
-Execution decisions are made against this resource graph, not against hardcoded tier assumptions.
-
----
-
-### 2. Object-Based Tiered Architecture
-
-All retrieval structures are decomposed into versioned objects:
-
-- Routing metadata
-- Candidate blocks
-- Compressed representations
-- Refine payload
-- Delta segments
-- Manifest metadata
-
-Object storage acts as the source of truth.
-
-Higher-performance tiers function as adaptive working sets and may be rebuilt, migrated, or evicted without affecting correctness.
-
----
-
-### 3. Query as an Execution Plan
-
-Each query is compiled into an execution plan under explicit constraints:
-
-- Latency budget
-- Resource budget
-- Tenant quota
-- Hardware state
-- Data residency
-
-The planner determines:
-
-- Which partitions or blocks to inspect
-- Which tiers to access
-- How much parallelism to apply
-- Whether to use CPU, GPU, or remote resources
-- When to degrade or terminate early
-
-Retrieval becomes a scheduling problem rather than a fixed algorithm call.
-
----
-
-### 4. Index-Agnostic Execution Model
-
-Divergence does not bind itself to HNSW, IVF, DiskANN, or any specific ANN method.
-
-Instead, retrieval is decomposed into composable stages:
-
-1. Router  
-   Identifies relevant partitions or blocks.
-
-2. Candidate Producer  
-   Generates candidate identifiers or block references.
-
-3. Pruner  
-   Eliminates unnecessary work using block-level or representation-level bounds.
-
-4. Scorer  
-   Computes similarity using CPU SIMD or GPU acceleration.
-
-5. Refiner  
-   Performs high-precision reranking using slower tiers when required.
-
-Different ANN techniques become specific implementations of these stages.
-
----
-
-### 5. Search RU: Unified Resource Accounting
-
-Project Divergence introduces a unified retrieval resource unit model called Search RU.
-
-Search RU accounts for:
-
-- DRAM bytes accessed
-- NVMe bytes read
-- Object storage operations
-- CPU cycles
-- GPU time
-- Network bandwidth
-
-Each tenant is allocated RU quotas and rate limits.
-
-The planner enforces RU budgets as hard constraints and applies controlled degradation policies when limits are reached.
-
-This enables:
-
-- Predictable multi-tenant isolation
-- Explicit cost control
-- Stable tail latency under load
+1. Maximize NVMe utilization without overwhelming CPU.
+2. Provide predictable p99 latency under limited DRAM.
+3. Support continuous performance-to-memory scaling.
+4. Avoid global index rebuilds during layout evolution.
+5. Maintain explicit control over IO and compute scheduling.
 
 ---
 
 ## Architecture Overview
 
+Divergence is organized into two layers:
+
+### Data Plane
+
+The performance-critical execution engine.
+
+Responsibilities:
+
+- Thread-per-core execution model
+- Coroutine-based async scheduling
+- Batched NVMe IO using io_uring
+- Explicit queue depth control
+- Record-level buffer pool
+- Two-stage scoring pipeline
+
 ### Control Plane
 
 Responsible for:
 
-- Resource accounting
 - Heat tracking
-- Tier placement policies
-- Statistics collection
+- Object placement decisions
+- Block reorganization
+- Tier migration policies
 - Background compaction
-- Version management
-
-### Data Plane
-
-Responsible for:
-
-- Execution plan evaluation
-- Batched asynchronous IO
-- Controlled concurrency
-- SIMD scoring
-- Optional GPU offload
-- Early termination
-
-The data plane is designed to remain minimal and deterministic.
 
 ---
 
 ## Storage Model
 
-Divergence uses a versioned manifest system.
+The index is decomposed into independent object types:
 
-- Object storage is authoritative.
-- Higher tiers are adaptive caches.
-- Index blocks are locally evolvable.
-- Reorganization can occur without global rebuilds.
+- Routing metadata
+- Candidate blocks (adjacency lists or posting lists)
+- Compressed vector codes
+- Exact vectors for refinement
+- Versioned manifest metadata
 
-This enables:
+Object storage is versioned locally.
 
-- Elastic scaling
-- Online reconfiguration
-- Hotset reshaping
-- Safe rollback
+Each object type can be independently cached, promoted, or evicted.
 
 ---
 
-## Performance and Cost Profiles
+## Execution Pipeline
 
-Divergence supports a continuous performance-to-cost spectrum.
+Each query follows a fixed pipeline:
 
-High Performance:
-- Large DRAM residency
-- Aggressive prefetch
-- GPU-enabled scoring
-- No cold-tier access
+1. Router  
+   Identify candidate partitions or entry points.
 
-Balanced:
-- Hot data in DRAM
-- Warm data in NVMe
-- Selective GPU usage
+2. Candidate Producer  
+   Generate candidate blocks.
 
-Cost Optimized:
-- Small hotset
-- Limited warm tier
-- Cold-tier access allowed
-- Strict RU budgets
+3. Scorer  
+   Compute approximate distances using compressed codes.
 
-All profiles share the same execution engine.
+4. Pruner  
+   Eliminate low-potential candidates.
+
+5. Refiner  
+   Load exact vectors from NVMe and compute final distances.
+
+Two-stage scoring minimizes NVMe reads while preserving recall.
 
 ---
 
-## Implementation Principles
+## NVMe-Native IO Model
 
-- Rust-native implementation
-- Explicit buffer management
-- Asynchronous IO runtime
-- Controlled queue depth
-- Lock-sharded internal structures
-- Pluggable retrieval stages
-- Resource-aware planning
+- io_uring with O_DIRECT
+- Fixed buffer pools
+- Controlled submission/completion queue depth
+- Batched 4KB reads aligned to physical page size
+- Overlapped compute and IO via coroutines
+
+The goal is to approach device-level throughput while keeping CPU fully utilized.
+
+---
+
+## Buffer Management
+
+Divergence uses record-level caching rather than page-level caching.
+
+Advantages:
+
+- Avoids lukewarm pages under skew
+- Captures fine-grained access patterns
+- Enables selective promotion of routing metadata
+- Reduces memory waste
+
+Eviction policy is heat-aware and object-type aware.
+
+---
+
+## Memory Scaling Model
+
+Divergence is designed to degrade gracefully as memory decreases:
+
+- With large DRAM: most routing metadata and compressed codes stay in memory.
+- With limited DRAM: compressed codes remain hot; exact vectors fetched on demand.
+- With minimal DRAM: search remains functional with increased NVMe reads.
+
+Performance scales continuously rather than collapsing.
+
+---
+
+## Concurrency Model
+
+- Thread-per-core
+- No global locks
+- Lock-sharded structures
+- Optimistic read paths
+- Backpressure via IO queue depth control
+
+The system prioritizes stable latency under load.
 
 ---
 
 ## Roadmap
 
 Phase 1:
-- Resource graph abstraction
-- Object store interface
-- Execution planner prototype
-- Single-node NVMe tier prototype
+- Single-node NVMe-native index
+- Thread-per-core execution
+- Record-level buffer pool
+- Two-stage scoring
 
 Phase 2:
-- Search RU enforcement
-- Multi-tenant quota management
-- Hybrid retrieval support
+- Heat-aware tier migration
+- Block reorganization without rebuild
+- Memory scaling benchmarks
 
 Phase 3:
-- Optional GPU integration
+- Multi-tenant resource accounting
+- Optional GPU acceleration
 - Distributed resource graph
-- Remote block access
 
 ---
 
-## Non-Goals
+## Non-Goals (for now)
 
+- Distributed execution
+- Object storage as primary backend
 - Embedding generation
-- End-to-end RAG application stack
-- Training infrastructure
+- Learned routing models
 
-Project Divergence focuses exclusively on the retrieval execution layer.
+These may be explored after the single-node core stabilizes.
 
 ---
 
 ## Status
 
-Early architecture stage.
+Early development stage.
 
-Contributions and design discussions are welcome.
+Focused on building a high-performance single-node NVMe-native retrieval core.
