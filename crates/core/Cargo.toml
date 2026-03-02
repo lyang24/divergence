@@ -7,3 +7,4 @@ edition.workspace = true
 thiserror = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+half = { workspace = true }

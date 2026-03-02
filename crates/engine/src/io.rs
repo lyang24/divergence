@@ -168,8 +168,86 @@ impl IoDriver {
         Ok(buf)
     }
 
+    /// Read one 4KB adjacency block directly into a SlotPtr buffer.
+    ///
+    /// SlotPtr is only created by SlotStore, guaranteeing 4KB alignment and
+    /// sufficient capacity. The slot is in LOADING state with pin_count=0,
+    /// so no other code accesses it concurrently.
+    pub(crate) async fn read_adj_block_direct(
+        &self,
+        vid: u32,
+        dst: crate::cache::SlotPtr,
+    ) -> io::Result<()> {
+        let _permit = self.adj_sem.acquire().await;
+
+        // Safety: SlotPtr guarantees 4KB-aligned, BLOCK_SIZE-capacity memory
+        // exclusively owned by the LOADING entry.
+        let buf = unsafe { SlotBuf::from_raw(dst.as_mut_ptr(), BLOCK_SIZE) };
+        let offset = vid as u64 * BLOCK_SIZE as u64;
+
+        let (result, _buf) = self.adj_file.read_at(buf, offset).await;
+        let n = result?;
+        if n != BLOCK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short read: {} bytes (expected {})", n, BLOCK_SIZE),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SlotBuf — wraps a raw *mut u8 as an IoBuf for monoio
+// ---------------------------------------------------------------------------
+
+/// Thin wrapper around a raw pointer for use as a monoio IO buffer.
+/// Does NOT own the memory — caller is responsible for lifetime.
+struct SlotBuf {
+    ptr: *mut u8,
+    capacity: usize,
+    len: usize,
+}
+
+impl SlotBuf {
+    /// # Safety
+    /// `ptr` must be valid, 4KB-aligned, and point to at least `capacity` bytes.
+    /// The memory must remain valid for the duration of the IO operation.
+    unsafe fn from_raw(ptr: *mut u8, capacity: usize) -> Self {
+        Self {
+            ptr,
+            capacity,
+            len: 0,
+        }
+    }
+}
+
+// Safety: pointer is stable (it's a SlotStore slot), buffer won't be moved.
+unsafe impl monoio::buf::IoBuf for SlotBuf {
+    fn read_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len
+    }
+}
+
+unsafe impl monoio::buf::IoBufMut for SlotBuf {
+    fn write_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    fn bytes_total(&mut self) -> usize {
+        self.capacity
+    }
+
+    unsafe fn set_init(&mut self, pos: usize) {
+        self.len = pos;
     }
 }
 

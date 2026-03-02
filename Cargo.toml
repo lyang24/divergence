@@ -49,3 +49,6 @@ libc = "0.2"
 
 # Error handling
 thiserror = "2"
+
+# FP16
+half = "2"
