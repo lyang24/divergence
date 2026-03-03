@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use divergence_core::distance::{
-    create_distance_computer, fp32_to_fp16, FP16VectorBank, FP32VectorBank, VectorBank,
+    create_distance_computer, fp32_to_fp16, FP16VectorBank, FP32SimdVectorBank,
+    FP32VectorBank, VectorBank,
 };
 use divergence_core::{MetricType, VectorId};
 use divergence_engine::{
@@ -93,7 +94,6 @@ fn disk_search_matches_memory() {
     let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
 
     let entry_set: Vec<VectorId> = meta.entry_set.iter().map(|&v| VectorId(v)).collect();
-    let distance = create_distance_computer(MetricType::L2);
 
     // 5. Run async disk search inside monoio runtime
     if !with_runtime(|rt| {
@@ -103,7 +103,7 @@ fn disk_search_matches_memory() {
                 .expect("failed to open IO driver");
 
             let pool = AdjacencyPool::new(64 * 1024);
-            let bank = FP32VectorBank::new(&disk_vectors, dim, &*distance);
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
             let mut perf = SearchPerfContext::default();
 
             disk_graph_search(
@@ -228,7 +228,6 @@ fn profile_cold_vs_warm() {
     let meta = IndexMeta::load_from(&dir.path().join("meta.json")).unwrap();
     let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
     let entry_set: Vec<VectorId> = meta.entry_set.iter().map(|&v| VectorId(v)).collect();
-    let dist = create_distance_computer(MetricType::L2);
 
     // 4. Generate query batch
     let queries: Vec<Vec<f32>> = generate_vectors(num_queries, dim, 999);
@@ -240,7 +239,7 @@ fn profile_cold_vs_warm() {
                 .expect("failed to open IO driver");
 
             let pool = AdjacencyPool::new(256 * 1024);
-            let bank = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
             let recorder = QueryRecorder::new();
 
             // === PASS 1: COLD CACHE ===
@@ -409,7 +408,6 @@ fn exp_freeze_queries_warm_hit() {
     let dir_str = dir.path().to_str().unwrap().to_owned();
     let (_meta, entry_set) = load_meta_entry(dir.path());
     let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
-    let dist = create_distance_computer(MetricType::L2);
     let queries = generate_vectors(num_queries, dim, 999);
 
     if !with_runtime(|rt| {
@@ -419,7 +417,7 @@ fn exp_freeze_queries_warm_hit() {
                 .expect("failed to open IO driver");
 
             let pool = AdjacencyPool::new(n * 4096);
-            let bank = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
             let recorder = QueryRecorder::new();
 
             // Pass 1: cold
@@ -497,7 +495,6 @@ fn exp_vary_cache_size() {
     let dir_str = dir.path().to_str().unwrap().to_owned();
     let (_meta, entry_set) = load_meta_entry(dir.path());
     let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
-    let dist = create_distance_computer(MetricType::L2);
     let queries = generate_vectors(num_queries, dim, 999);
 
     let cache_sizes_kb: Vec<usize> = vec![256, 1024, 4096, 8192];
@@ -508,7 +505,7 @@ fn exp_vary_cache_size() {
                 .await
                 .expect("failed to open IO driver");
 
-            let bank = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
 
             eprintln!("\n========== EXP2: VARY CACHE SIZE ==========");
             eprintln!(
@@ -585,7 +582,6 @@ fn exp_vary_dimension() {
         let dir_str = dir.path().to_str().unwrap().to_owned();
         let (_meta, entry_set) = load_meta_entry(dir.path());
         let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
-        let dist = create_distance_computer(MetricType::L2);
         let queries = generate_vectors(num_queries, dim, 999);
 
         if !with_runtime(|rt| {
@@ -595,7 +591,7 @@ fn exp_vary_dimension() {
                     .expect("failed to open IO driver");
 
                 let pool = AdjacencyPool::new(256 * 1024);
-                let bank = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+                let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
                 let mut sum_io = 0u64;
                 let mut sum_dist = 0u64;
                 let mut sum_compute = 0u64;
@@ -649,11 +645,41 @@ fn exp_vary_dimension() {
 }
 
 // ---------------------------------------------------------------------------
-// Experiment 4: FP32 vs FP16 distance comparison
+// Experiment 4: 3-way fair comparison (fp32-auto / fp32-simd / fp16-fused)
 // ---------------------------------------------------------------------------
 
-/// A/B comparison: FP32 vs FP16 distance at dim=512 and dim=768.
-/// Measures: dist_ns reduction, total latency reduction, distance accuracy.
+/// Helper: run a batch of queries, accumulate dist_ns and total_ns.
+async fn measure_search_pass(
+    queries: &[Vec<f32>],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    bank: &dyn VectorBank,
+) -> (u64, u64, u64) {
+    let mut total_ns = 0u64;
+    let mut dist_ns = 0u64;
+    let mut dist_calls = 0u64;
+    for q in queries {
+        let mut perf = SearchPerfContext::default();
+        let t = std::time::Instant::now();
+        disk_graph_search(
+            q, entry_set, k, ef, pool, io, bank,
+            &mut perf, PerfLevel::EnableTime,
+        )
+        .await;
+        total_ns += t.elapsed().as_nanos() as u64;
+        dist_ns += perf.dist_ns;
+        dist_calls += perf.distance_computes;
+    }
+    (total_ns, dist_ns, dist_calls)
+}
+
+/// 3-way fair comparison at dim=512 and dim=768.
+/// fp32-auto: iterator-based L2 (relies on autovectorization)
+/// fp32-simd: hand-written AVX2+FMA L2 (fair baseline for FP16)
+/// fp16-fused: hand-written AVX2+f16c+FMA fused convert+L2
 #[test]
 fn exp_fp32_vs_fp16() {
     let n = 2000;
@@ -662,10 +688,10 @@ fn exp_fp32_vs_fp16() {
     let num_queries = 100;
     let dims = [512, 768];
 
-    eprintln!("\n========== EXP4: FP32 vs FP16 ==========");
+    eprintln!("\n========== EXP4: 3-WAY FAIR COMPARISON ==========");
     eprintln!(
-        "{:<8} {:<6} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "dim", "mode", "total_us", "dist_us", "dist%", "dist/call", "speedup"
+        "{:<8} {:<12} {:>10} {:>10} {:>10} {:>10} {:>12}",
+        "dim", "mode", "total_us", "dist_us", "dist%", "ns/call", "vs-simd"
     );
 
     for &dim in &dims {
@@ -683,87 +709,61 @@ fn exp_fp32_vs_fp16() {
                     .await
                     .expect("failed to open IO driver");
 
-                // --- FP32 pass ---
-                let pool_fp32 = AdjacencyPool::new(256 * 1024);
-                let bank_fp32 = FP32VectorBank::new(&disk_vectors, dim, &*dist);
-                let mut fp32_total = 0u64;
-                let mut fp32_dist = 0u64;
-                let mut fp32_dist_calls = 0u64;
-
-                for q in &queries {
-                    let mut perf = SearchPerfContext::default();
-                    let t = std::time::Instant::now();
-                    disk_graph_search(
-                        q, &entry_set, k, ef, &pool_fp32, &io, &bank_fp32,
-                        &mut perf, PerfLevel::EnableTime,
-                    )
-                    .await;
-                    fp32_total += t.elapsed().as_nanos() as u64;
-                    fp32_dist += perf.dist_ns;
-                    fp32_dist_calls += perf.distance_computes;
-                }
-
-                // --- FP16 pass ---
-                let pool_fp16 = AdjacencyPool::new(256 * 1024);
-                let bank_fp16 = FP16VectorBank::new(&vectors_fp16, dim, MetricType::L2);
-                let mut fp16_total = 0u64;
-                let mut fp16_dist = 0u64;
-                let mut fp16_dist_calls = 0u64;
-
-                for q in &queries {
-                    let mut perf = SearchPerfContext::default();
-                    let t = std::time::Instant::now();
-                    disk_graph_search(
-                        q, &entry_set, k, ef, &pool_fp16, &io, &bank_fp16,
-                        &mut perf, PerfLevel::EnableTime,
-                    )
-                    .await;
-                    fp16_total += t.elapsed().as_nanos() as u64;
-                    fp16_dist += perf.dist_ns;
-                    fp16_dist_calls += perf.distance_computes;
-                }
-
                 let nq = num_queries as f64;
-                let fp32_mean = fp32_total as f64 / nq / 1000.0;
-                let fp16_mean = fp16_total as f64 / nq / 1000.0;
-                let fp32_dist_mean = fp32_dist as f64 / nq / 1000.0;
-                let fp16_dist_mean = fp16_dist as f64 / nq / 1000.0;
-                let fp32_dist_pct = fp32_dist as f64 / fp32_total as f64 * 100.0;
-                let fp16_dist_pct = fp16_dist as f64 / fp16_total as f64 * 100.0;
-                let fp32_per_call = if fp32_dist_calls > 0 {
-                    fp32_dist as f64 / fp32_dist_calls as f64
-                } else {
-                    0.0
-                };
-                let fp16_per_call = if fp16_dist_calls > 0 {
-                    fp16_dist as f64 / fp16_dist_calls as f64
-                } else {
-                    0.0
+
+                // --- FP32 autovectorized ---
+                let pool1 = AdjacencyPool::new(n * 4096);
+                let bank_auto = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+                let (auto_total, auto_dist, auto_calls) = measure_search_pass(
+                    &queries, &entry_set, k, ef, &pool1, &io, &bank_auto,
+                ).await;
+
+                // --- FP32 hand SIMD ---
+                let pool2 = AdjacencyPool::new(n * 4096);
+                let bank_simd = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
+                let (simd_total, simd_dist, simd_calls) = measure_search_pass(
+                    &queries, &entry_set, k, ef, &pool2, &io, &bank_simd,
+                ).await;
+
+                // --- FP16 fused ---
+                let pool3 = AdjacencyPool::new(n * 4096);
+                let bank_fp16 = FP16VectorBank::new(&vectors_fp16, dim, MetricType::L2);
+                let (fp16_total, fp16_dist, fp16_calls) = measure_search_pass(
+                    &queries, &entry_set, k, ef, &pool3, &io, &bank_fp16,
+                ).await;
+
+                let auto_pc = if auto_calls > 0 { auto_dist as f64 / auto_calls as f64 } else { 0.0 };
+                let simd_pc = if simd_calls > 0 { simd_dist as f64 / simd_calls as f64 } else { 0.0 };
+                let fp16_pc = if fp16_calls > 0 { fp16_dist as f64 / fp16_calls as f64 } else { 0.0 };
+
+                let print_row = |label: &str, total: u64, dist: u64, calls: u64, pc: f64, vs_simd: Option<f64>| {
+                    let t_us = total as f64 / nq / 1000.0;
+                    let d_us = dist as f64 / nq / 1000.0;
+                    let d_pct = dist as f64 / total as f64 * 100.0;
+                    let _ = calls;
+                    match vs_simd {
+                        None => eprintln!(
+                            "{:<8} {:<12} {:>10.0} {:>10.0} {:>10.1} {:>10.0} {:>12}",
+                            dim, label, t_us, d_us, d_pct, pc, "-"
+                        ),
+                        Some(ratio) => eprintln!(
+                            "{:<8} {:<12} {:>10.0} {:>10.0} {:>10.1} {:>10.0} {:>12.2}x",
+                            dim, label, t_us, d_us, d_pct, pc, ratio
+                        ),
+                    }
                 };
 
-                let dist_speedup = if fp16_per_call > 0.0 {
-                    fp32_per_call / fp16_per_call
-                } else {
-                    0.0
-                };
-                let total_speedup = if fp16_mean > 0.0 {
-                    fp32_mean / fp16_mean
-                } else {
-                    0.0
-                };
+                print_row("fp32-auto", auto_total, auto_dist, auto_calls, auto_pc, None);
+                print_row("fp32-simd", simd_total, simd_dist, simd_calls, simd_pc, Some(auto_pc / simd_pc));
+                print_row("fp16-fused", fp16_total, fp16_dist, fp16_calls, fp16_pc,
+                    Some(simd_pc / fp16_pc));
 
+                let total_vs_simd = simd_total as f64 / fp16_total as f64;
                 eprintln!(
-                    "{:<8} {:<6} {:>10.0} {:>10.0} {:>10.1} {:>10.0} {:>10}",
-                    dim, "fp32", fp32_mean, fp32_dist_mean, fp32_dist_pct, fp32_per_call, "-"
-                );
-                eprintln!(
-                    "{:<8} {:<6} {:>10.0} {:>10.0} {:>10.1} {:>10.0} {:>10.2}x",
-                    dim, "fp16", fp16_mean, fp16_dist_mean, fp16_dist_pct, fp16_per_call,
-                    dist_speedup
-                );
-                eprintln!(
-                    "  dim={} total speedup: {:.2}x ({:.0}us → {:.0}us)",
-                    dim, total_speedup, fp32_mean, fp16_mean
+                    "  dim={}: fp16 vs fp32-simd total: {:.2}x ({:.0}us → {:.0}us)",
+                    dim, total_vs_simd,
+                    simd_total as f64 / nq / 1000.0,
+                    fp16_total as f64 / nq / 1000.0,
                 );
             });
         }) {
@@ -828,7 +828,6 @@ fn exp_recall_check() {
         let dir_str = dir.path().to_str().unwrap().to_owned();
         let (_meta, entry_set) = load_meta_entry(dir.path());
         let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
-        let dist = create_distance_computer(MetricType::L2);
         let vectors_fp16 = fp32_to_fp16(&disk_vectors);
         let queries = generate_vectors(num_queries, dim, 999);
 
@@ -851,7 +850,7 @@ fn exp_recall_check() {
 
                 // --- FP32 recall ---
                 let pool = AdjacencyPool::new(n * 4096); // large cache = no eviction noise
-                let bank_fp32 = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+                let bank_fp32 = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
                 let mut fp32_recalls = Vec::with_capacity(num_queries);
 
                 for (i, q) in queries.iter().enumerate() {
@@ -945,7 +944,6 @@ fn exp_budgeted_refine() {
     let dir_str = dir.path().to_str().unwrap().to_owned();
     let (_meta, entry_set) = load_meta_entry(dir.path());
     let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
-    let dist = create_distance_computer(MetricType::L2);
     let vectors_fp16 = fp32_to_fp16(&disk_vectors);
     let queries = generate_vectors(num_queries, dim, 999);
 
@@ -974,7 +972,7 @@ fn exp_budgeted_refine() {
 
             // --- Mode 1: FP32-only ---
             let pool = AdjacencyPool::new(n * 4096);
-            let bank_fp32 = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+            let bank_fp32 = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
             let mut fp32_recalls = Vec::with_capacity(num_queries);
             let mut fp32_total_ns = 0u64;
             let mut fp32_dist_ns = 0u64;
@@ -1129,7 +1127,6 @@ fn search_guard_records_perf() {
     let meta = IndexMeta::load_from(&dir.path().join("meta.json")).unwrap();
     let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
     let entry_set: Vec<VectorId> = meta.entry_set.iter().map(|&v| VectorId(v)).collect();
-    let dist = create_distance_computer(MetricType::L2);
     let query = generate_vectors(1, dim, 999)[0].clone();
 
     if !with_runtime(|rt| {
@@ -1138,7 +1135,7 @@ fn search_guard_records_perf() {
                 .await
                 .expect("failed to open IO driver");
             let pool = AdjacencyPool::new(64 * 1024);
-            let bank = FP32VectorBank::new(&disk_vectors, dim, &*dist);
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
             let recorder = QueryRecorder::new();
 
             // Run with SearchGuard — RAII should auto-record
