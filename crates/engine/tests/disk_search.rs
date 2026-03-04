@@ -3241,10 +3241,20 @@ fn exp_p1_prefetch_latency_sweep() {
     let index = builder.build();
     eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
 
-    // Write to disk
-    let dir = tempfile::tempdir().unwrap();
-    let dir_str = dir.path().to_str().unwrap().to_owned();
-    let writer = IndexWriter::new(dir.path());
+    // Write to disk — use BENCH_DIR for NVMe/O_DIRECT, else tmpfs tempdir
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir; // hold tempdir lifetime
+    let dir_path: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        dir_path = std::path::PathBuf::from(bd);
+        std::fs::create_dir_all(&dir_path).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        dir_path = _tmpdir.path().to_path_buf();
+    }
+    let dir_str = dir_path.to_str().unwrap().to_owned();
+    let writer = IndexWriter::new(&dir_path);
     writer
         .write(
             n as u32, dim, "cosine", index.max_degree(), ef_construction,
@@ -3252,10 +3262,11 @@ fn exp_p1_prefetch_latency_sweep() {
             index.vectors_raw(), |vid| index.neighbors(vid),
         )
         .unwrap();
+    eprintln!("  Index written to {} (direct_io={})", dir_str, direct_io);
 
-    let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
+    let disk_vectors = load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap();
     let entry_set: Vec<VectorId> = {
-        let meta = IndexMeta::load_from(&dir.path().join("meta.json")).unwrap();
+        let meta = IndexMeta::load_from(&dir_path.join("meta.json")).unwrap();
         meta.entry_set.iter().map(|&v| VectorId(v)).collect()
     };
 
@@ -3273,7 +3284,7 @@ fn exp_p1_prefetch_latency_sweep() {
     if !with_runtime(|rt| {
         rt.block_on(async {
             let io = Rc::new(
-                IoDriver::open(&dir_str, dim, 64, false)
+                IoDriver::open(&dir_str, dim, 64, direct_io)
                     .await
                     .expect("failed to open IO driver"),
             );
