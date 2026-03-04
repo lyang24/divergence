@@ -46,10 +46,7 @@ impl LocalSemaphore {
 
     /// Acquire a permit. Suspends if none available.
     pub fn acquire(&self) -> SemAcquire<'_> {
-        SemAcquire {
-            sem: self,
-            registered: false,
-        }
+        SemAcquire { sem: self }
     }
 
     fn try_acquire(&self) -> bool {
@@ -60,6 +57,11 @@ impl LocalSemaphore {
         } else {
             false
         }
+    }
+
+    /// Number of permits currently available (not acquired).
+    pub fn available(&self) -> usize {
+        self.state.borrow().permits
     }
 
     fn release(&self) {
@@ -77,7 +79,6 @@ impl LocalSemaphore {
 
 pub struct SemAcquire<'a> {
     sem: &'a LocalSemaphore,
-    registered: bool,
 }
 
 impl<'a> Future for SemAcquire<'a> {
@@ -88,10 +89,10 @@ impl<'a> Future for SemAcquire<'a> {
         if this.sem.try_acquire() {
             Poll::Ready(SemPermit { sem: this.sem })
         } else {
-            if !this.registered {
-                this.sem.register_waker(cx.waker().clone());
-                this.registered = true;
-            }
+            // Must re-register on every poll. If a previous wakeup occurred but
+            // another task stole the permit before we were polled (lost wakeup),
+            // we need a fresh waker in the queue or we'll never be woken again.
+            this.sem.register_waker(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -119,6 +120,7 @@ impl<'a> Drop for SemPermit<'a> {
 pub struct IoDriver {
     adj_file: File,
     adj_sem: LocalSemaphore,
+    adj_capacity: usize,
     dimension: usize,
 }
 
@@ -145,6 +147,7 @@ impl IoDriver {
         Ok(Self {
             adj_file,
             adj_sem: LocalSemaphore::new(adj_inflight),
+            adj_capacity: adj_inflight,
             dimension,
         })
     }
@@ -198,6 +201,16 @@ impl IoDriver {
 
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    /// Total adjacency IO permits (inflight budget configured at open time).
+    pub fn adj_capacity(&self) -> usize {
+        self.adj_capacity
+    }
+
+    /// Number of adjacency IO permits currently available.
+    pub fn available_adj_permits(&self) -> usize {
+        self.adj_sem.available()
     }
 }
 

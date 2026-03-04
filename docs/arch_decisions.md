@@ -82,12 +82,19 @@ in the hot loop saves one op per distance call and avoids unnecessary floating-p
 **Prerequisite**: AD-3 guarantees all vectors are L2-normalized before quantization.
 This means every component is in [-1, 1], so the quantization scheme can exploit this.
 
-**MVP decision** (pre-normalized cosine path):
+**Decision** (cosine path — the only production path):
+
+Scale = 1. No training. No per-dataset parameter:
 ```
 code[i] = clamp(round(x[i] * 127), -127, 127)    // signed i8, [-127, 127]
 ```
-No training step needed. No scale parameter. Every component maps [-1, 1] → [-127, 127]
-directly. This is correct because L2-normalization bounds all components to [-1, 1].
+This is equivalent to `scale = 1` in a generic `round(x / scale * 127)` formula.
+Correct because AD-3 guarantees L2-normalization → all components ∈ [-1, 1].
+
+**Not** `scale = max(|x[i]|)` over all vectors/dims. That formula is **wrong** here:
+even though maxabs ≈ 1 for normalized vectors, it introduces a dataset-dependent
+parameter that (a) can be poisoned by outliers in the non-normalized case, and
+(b) adds unnecessary state. Scale = 1 is unconditionally correct for unit vectors.
 
 **For non-normalized paths** (future, if we add L2/IP without pre-normalization):
 Use percentile-based scale (e.g., 99.9th percentile of |x[i]| across all vectors/dims),
@@ -98,10 +105,17 @@ scale = percentile(|x[i]|, 99.9)      // robust to outliers
 code[i] = clamp(round(x[i] / scale * 127), -127, 127)
 ```
 
-**Upgrade path**: Per-dimension scale (FAISS QT_8bit style) if recall degrades on
-specific datasets. Per-dim stores vmin + vdiff per dimension (2 × dim × 4B extra
-metadata), but captures per-dimension variance better. Low switching cost — only
-the quantizer changes, kernel stays the same.
+**Per-dimension scale is WRONG for cosine** (2026-03-02, validated on Cohere 100K):
+
+Per-dim scale (`code[d] = x[d] / scale_d * 127`) distorts the dot product into a
+re-weighted inner product `sum_d (q_d * v_d / scale_d^2)`. Dimensions with small
+variance get artificially amplified. Result on Cohere 768d: recall dropped from
+0.887 (uniform) to 0.377 (per-dim). Per-dim scale is only valid for L2/IP on
+non-normalized vectors where you want to equalize dynamic range across dimensions.
+
+**Upgrade path for cosine**: RaBitQ or product quantization — fundamentally different
+quantization families that preserve the inner product structure. Uniform int8 + refine
+R=2k already achieves 0.962 recall at 1.62x speedup, so this is not urgent.
 
 **Why signed i8, not unsigned u8**:
 - Pre-normalized vectors are centered around 0 → signed is natural

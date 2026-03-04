@@ -12,4 +12,4 @@ pub use perf::{
     Histogram, PerfLevel, QueryRecorder, SchedLagTracker, SearchGuard, SearchPerfContext,
 };
 pub use runtime::{spawn_worker, WorkerConfig};
-pub use search::{disk_graph_search, disk_graph_search_refine};
+pub use search::{disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_refine};

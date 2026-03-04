@@ -1,7 +1,7 @@
 //! AdjacencyPool: per-core set-associative block cache for adjacency reads.
 //!
 //! Design contracts:
-//! 1. No hot-path allocation — all slots pre-allocated, waiter is Option<Waker>
+//! 1. No hot-path allocation — all slots pre-allocated, waiters use fixed-capacity inline array
 //! 2. Per-core — RefCell/Cell only, no atomics, no Mutex
 //! 3. State machine — EMPTY → LOADING → READY with load_gen epoch
 //! 4. In-flight dedup — LOADING entry: waiters use WaitForReady(slot_idx, vid, gen)
@@ -21,6 +21,129 @@ use divergence_storage::BLOCK_SIZE;
 use crate::io::IoDriver;
 
 const SET_WAYS: u32 = 8;
+const MAX_PREFETCH_QUEUE: usize = 16;
+
+/// Max concurrent waiters per LOADING entry.
+/// Bounded by coroutines-per-core: beam search (1) + prefetch window (~4-8).
+/// Set to 8 (matching SET_WAYS) to cover worst case. Each Option<Waker> is
+/// 16 bytes, so 128 bytes per entry × 128 entries = 16KB overhead.
+const MAX_WAITERS_PER_ENTRY: usize = 8;
+
+// ---------------------------------------------------------------------------
+// WaiterArray — fixed-capacity, zero-allocation waker storage
+// ---------------------------------------------------------------------------
+
+/// Fixed-capacity array of wakers. No heap allocation ever.
+///
+/// Invariant: `wakers[0..len]` are all `Some`, `wakers[len..]` are all `None`.
+struct WaiterArray {
+    wakers: [Option<Waker>; MAX_WAITERS_PER_ENTRY],
+    len: u8,
+}
+
+impl WaiterArray {
+    fn new() -> Self {
+        Self {
+            wakers: Default::default(),
+            len: 0,
+        }
+    }
+
+    /// Register a waker. Returns true if registered, false if full.
+    /// Caller should handle the full case (fall through to re-probe).
+    fn push(&mut self, waker: Waker) -> bool {
+        if (self.len as usize) < MAX_WAITERS_PER_ENTRY {
+            self.wakers[self.len as usize] = Some(waker);
+            self.len += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Wake all registered wakers and clear the array.
+    fn wake_all(&mut self) {
+        for slot in self.wakers[..self.len as usize].iter_mut() {
+            if let Some(w) = slot.take() {
+                w.wake();
+            }
+        }
+        self.len = 0;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PrefetchChannel — SPSC ring buffer for prefetch hints
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct PrefetchEntry {
+    vid: u32,
+    slot_idx: u32,
+    load_gen: u32,
+}
+
+struct PrefetchChannel {
+    buf: [Option<PrefetchEntry>; MAX_PREFETCH_QUEUE],
+    head: usize,
+    tail: usize,
+    len: usize,
+    waker: Option<Waker>,
+    stopped: bool,
+}
+
+impl PrefetchChannel {
+    fn new() -> Self {
+        Self {
+            buf: [None; MAX_PREFETCH_QUEUE],
+            head: 0,
+            tail: 0,
+            len: 0,
+            waker: None,
+            stopped: false,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.len >= MAX_PREFETCH_QUEUE
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Push a prefetch entry. Auto-wakes the worker when queue transitions empty→non-empty.
+    fn push(&mut self, entry: PrefetchEntry) -> bool {
+        if self.len >= MAX_PREFETCH_QUEUE {
+            return false;
+        }
+        let was_empty = self.len == 0;
+        self.buf[self.tail] = Some(entry);
+        self.tail = (self.tail + 1) % MAX_PREFETCH_QUEUE;
+        self.len += 1;
+        if was_empty {
+            if let Some(w) = self.waker.as_ref() {
+                w.wake_by_ref();
+            }
+        }
+        true
+    }
+
+    fn pop(&mut self) -> Option<PrefetchEntry> {
+        if self.len == 0 {
+            return None;
+        }
+        let entry = self.buf[self.head].take();
+        self.head = (self.head + 1) % MAX_PREFETCH_QUEUE;
+        self.len -= 1;
+        entry
+    }
+}
 
 /// Fibonacci hashing multiplier for u32 keys.
 const FIB_HASH: u64 = 11400714819323198485; // 2^64 / φ
@@ -59,8 +182,9 @@ struct Entry {
     state: SlotState,
     load_gen: u32,     // incremented each LOADING transition
     referenced: bool,  // clock second-chance bit
+    prefetched: bool,  // true if loaded via prefetch_hint (for consumed tracking)
     pin_count: u32,    // live CacheGuards
-    waiter: Option<Waker>,
+    waiters: WaiterArray,  // fixed-capacity, zero-alloc
 }
 
 impl Entry {
@@ -70,8 +194,9 @@ impl Entry {
             state: SlotState::Empty,
             load_gen: 0,
             referenced: false,
+            prefetched: false,
             pin_count: 0,
-            waiter: None,
+            waiters: WaiterArray::new(),
         }
     }
 
@@ -79,9 +204,10 @@ impl Entry {
         self.vid = u32::MAX;
         self.state = SlotState::Empty;
         self.referenced = false;
+        self.prefetched = false;
         self.pin_count = 0;
         // load_gen is NOT reset — monotonically increasing
-        // waiter is NOT cleared here — find_or_evict caller handles it
+        // waiters are NOT cleared here — find_or_evict caller handles it
     }
 }
 
@@ -91,6 +217,7 @@ impl Entry {
 
 struct PoolState {
     entries: Vec<Entry>,
+    prefetch: PrefetchChannel,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +277,7 @@ pub struct CacheStatsSnapshot {
     pub evictions: u64,
     pub evict_fail_all_pinned: u64,
     pub bypasses: u64,
+    pub prefetch_hits: u64,
 }
 
 struct CacheStats {
@@ -159,6 +287,7 @@ struct CacheStats {
     evictions: Cell<u64>,
     evict_fail_all_pinned: Cell<u64>,
     bypasses: Cell<u64>,
+    prefetch_hits: Cell<u64>,
 }
 
 impl CacheStats {
@@ -170,6 +299,7 @@ impl CacheStats {
             evictions: Cell::new(0),
             evict_fail_all_pinned: Cell::new(0),
             bypasses: Cell::new(0),
+            prefetch_hits: Cell::new(0),
         }
     }
 
@@ -192,6 +322,9 @@ impl CacheStats {
     fn inc_bypasses(&self) {
         self.bypasses.set(self.bypasses.get() + 1);
     }
+    fn inc_prefetch_hits(&self) {
+        self.prefetch_hits.set(self.prefetch_hits.get() + 1);
+    }
 
     fn snapshot(&self) -> CacheStatsSnapshot {
         CacheStatsSnapshot {
@@ -201,6 +334,7 @@ impl CacheStats {
             evictions: self.evictions.get(),
             evict_fail_all_pinned: self.evict_fail_all_pinned.get(),
             bypasses: self.bypasses.get(),
+            prefetch_hits: self.prefetch_hits.get(),
         }
     }
 }
@@ -258,6 +392,7 @@ impl AdjacencyPool {
         Self {
             state: RefCell::new(PoolState {
                 entries,
+                prefetch: PrefetchChannel::new(),
             }),
             slot_store: SlotStore::new(total_slots),
             num_sets,
@@ -298,6 +433,10 @@ impl AdjacencyPool {
             match entry.state {
                 SlotState::Ready => {
                     entry.referenced = true;
+                    if entry.prefetched {
+                        entry.prefetched = false;
+                        self.stats.inc_prefetch_hits();
+                    }
                     entry.pin_count += 1;
                     self.stats.inc_hits();
                     return ProbeResult::Hit { slot_idx: idx };
@@ -324,7 +463,16 @@ impl AdjacencyPool {
         let set_idx = self.set_index(vid);
         let base = self.set_base(set_idx);
         let mut state = self.state.borrow_mut();
+        Self::find_or_evict_inner(&mut state, &self.stats, base)
+    }
 
+    /// Inner eviction logic operating on an already-borrowed PoolState.
+    /// Used by both `find_or_evict` and `prefetch_hint` (which already holds borrow_mut).
+    fn find_or_evict_inner(
+        state: &mut PoolState,
+        stats: &CacheStats,
+        base: u32,
+    ) -> Option<u32> {
         // Pass 1: any empty slot?
         for way in 0..SET_WAYS {
             let idx = base + way;
@@ -356,16 +504,14 @@ impl AdjacencyPool {
             }
 
             // Evict this slot
-            if let Some(w) = entry.waiter.take() {
-                w.wake();
-            }
+            entry.waiters.wake_all();
             entry.reset();
-            self.stats.inc_evictions();
+            stats.inc_evictions();
             return Some(idx);
         }
 
         // All slots pinned or loading
-        self.stats.inc_evict_fail();
+        stats.inc_evict_fail();
         None
     }
 
@@ -404,6 +550,14 @@ impl AdjacencyPool {
     /// decoding the adjacency block. Do not hold it across await points or
     /// store it in result sets.
     pub async fn get_or_load(&self, vid: u32, io: &IoDriver) -> io::Result<CacheGuard<'_>> {
+        // Guard 1: overflow_retries bounds the reprobe loop. If we can't
+        // register as a waiter after MAX_OVERFLOW_RETRIES attempts (waiter
+        // array full every time), fall back to bypass read. This prevents
+        // soft livelock under extreme waiter pressure (prefetch window saturating
+        // a hot set). The cost is one duplicate IO — acceptable for progress.
+        const MAX_OVERFLOW_RETRIES: u32 = 2;
+        let mut overflow_retries: u32 = 0;
+
         loop {
             match self.probe_set(vid) {
                 ProbeResult::Hit { slot_idx } => {
@@ -423,8 +577,42 @@ impl AdjacencyPool {
                         slot_idx,
                         vid,
                         load_gen,
+                        registered: false,
                     };
-                    wait.await;
+                    let did_wait = wait.await;
+
+                    if !did_wait {
+                        // WaitForReady returned immediately: overflow (waiter
+                        // array full), gen mismatch, or IO-failed rollback.
+                        //
+                        // Guard 2: yield to executor before re-probing. monoio
+                        // has no public submit/flush API, but its executor does
+                        // IO poll during scheduling. YieldOnce (wake_by_ref +
+                        // Pending) returns us to the run queue; the executor
+                        // processes CQEs before re-scheduling us.
+                        //
+                        // DO NOT REMOVE THIS YIELD — without it, overflow causes
+                        // a busy-loop that starves IO completion and hangs the core.
+                        YieldOnce::new().await;
+
+                        // Guard 1: after MAX_OVERFLOW_RETRIES immediate returns,
+                        // fall back to bypass (uncached direct read). This trades
+                        // one duplicate IO for guaranteed progress — prevents soft
+                        // livelock when a hot set's waiter array stays saturated.
+                        overflow_retries += 1;
+                        if overflow_retries > MAX_OVERFLOW_RETRIES {
+                            self.stats.inc_bypasses();
+                            let buf = io.read_adj_block(vid).await?;
+                            return Ok(CacheGuard {
+                                pool: self,
+                                slot_idx: u32::MAX,
+                                bypass_buf: Some(buf),
+                            });
+                        }
+                    }
+                    // Normal dedup (did_wait=true): IO completed, re-probe
+                    // for CacheGuard. No overflow counting needed.
+
                     continue; // re-probe to get CacheGuard
                 }
                 ProbeResult::Miss => {
@@ -481,9 +669,7 @@ impl AdjacencyPool {
             let entry = &mut state.entries[slot_idx as usize];
             entry.state = SlotState::Ready;
             entry.pin_count = 1;
-            if let Some(w) = entry.waiter.take() {
-                w.wake();
-            }
+            entry.waiters.wake_all();
         }
 
         Ok(CacheGuard {
@@ -491,6 +677,226 @@ impl AdjacencyPool {
             slot_idx,
             bypass_buf: None,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Prefetch API
+    // -----------------------------------------------------------------------
+
+    /// Enqueue a prefetch hint for `vid`. Sync (no await, no spawn).
+    ///
+    /// 1. If vid is already READY or LOADING in its set: return (no-op).
+    /// 2. If the prefetch channel is full: return silently (backpressure).
+    /// 3. Evict a slot, set it to LOADING with `prefetched=true`, push to channel.
+    /// 4. Channel push auto-wakes the prefetch worker if queue was empty.
+    pub fn prefetch_hint(&self, vid: u32) {
+        let set_idx = self.set_index(vid);
+        let base = self.set_base(set_idx);
+        let mut state = self.state.borrow_mut();
+
+        // Check if vid is already present (READY or LOADING)
+        for way in 0..SET_WAYS {
+            let idx = (base + way) as usize;
+            let entry = &mut state.entries[idx];
+            if entry.vid == vid && entry.state != SlotState::Empty {
+                if entry.state == SlotState::Ready {
+                    entry.referenced = true;
+                }
+                return;
+            }
+        }
+
+        // Channel full → drop hint silently
+        if state.prefetch.is_full() {
+            return;
+        }
+
+        // Find or evict a slot
+        let slot_idx = match Self::find_or_evict_inner(&mut state, &self.stats, base) {
+            Some(idx) => idx,
+            None => return, // all pinned/loading
+        };
+
+        // Transition to LOADING with prefetched flag
+        let entry = &mut state.entries[slot_idx as usize];
+        entry.vid = vid;
+        entry.state = SlotState::Loading;
+        entry.load_gen = entry.load_gen.wrapping_add(1);
+        entry.referenced = true;
+        entry.prefetched = true;
+        entry.pin_count = 0;
+        let load_gen = entry.load_gen;
+
+        // Push to channel (auto-wakes worker if was empty)
+        state.prefetch.push(PrefetchEntry {
+            vid,
+            slot_idx,
+            load_gen,
+        });
+    }
+
+    /// Check if `vid` is currently in LOADING state.
+    pub fn is_loading(&self, vid: u32) -> bool {
+        let set_idx = self.set_index(vid);
+        let base = self.set_base(set_idx);
+        let state = self.state.borrow();
+        for way in 0..SET_WAYS {
+            let idx = (base + way) as usize;
+            if state.entries[idx].vid == vid && state.entries[idx].state == SlotState::Loading {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Signal the prefetch worker to stop. Wake it if it's sleeping.
+    pub fn stop_prefetch(&self) {
+        let mut state = self.state.borrow_mut();
+        state.prefetch.stopped = true;
+        if let Some(w) = state.prefetch.waker.take() {
+            w.wake();
+        }
+    }
+
+    /// Spawn the per-core prefetch worker as a monoio task.
+    ///
+    /// `prefetch_budget`: max concurrent prefetch IOs. This is the prefetch-
+    /// specific cap — prevents prefetch from starving `get_or_load` for adj_sem
+    /// permits. Total inflight IO is bounded by min(adj_sem, search + prefetch_budget).
+    ///
+    /// Guideline: set prefetch_budget to 2–4. Higher values increase inflight
+    /// depth but also increase p99 due to permit contention with the search path.
+    ///
+    /// Call once per core. Stop via `pool.stop_prefetch()` + `handle.await`.
+    pub fn spawn_prefetch_worker(
+        pool: std::rc::Rc<AdjacencyPool>,
+        io: std::rc::Rc<IoDriver>,
+        prefetch_budget: usize,
+    ) -> monoio::task::JoinHandle<()> {
+        let pf_sem = std::rc::Rc::new(crate::io::LocalSemaphore::new(prefetch_budget));
+        monoio::spawn(prefetch_worker(pool, io, pf_sem))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PrefetchWait — future that waits for work in the prefetch channel
+// ---------------------------------------------------------------------------
+
+/// Polls the prefetch channel. Returns `true` if work available, `false` if stopped.
+struct PrefetchWait<'a> {
+    pool: &'a AdjacencyPool,
+}
+
+impl<'a> Future for PrefetchWait<'a> {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        let this = self.get_mut();
+        let mut state = this.pool.state.borrow_mut();
+        if state.prefetch.stopped {
+            return Poll::Ready(false);
+        }
+        if !state.prefetch.is_empty() {
+            return Poll::Ready(true);
+        }
+        // Store waker and wait
+        state.prefetch.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+// ---------------------------------------------------------------------------
+// prefetch_worker — per-core singleton async task, bounded concurrency
+// ---------------------------------------------------------------------------
+
+/// Complete a single prefetch IO: acquire prefetch permit, read, transition.
+///
+/// Holds `pf_sem` permit for the duration of the IO — this is the cap that
+/// prevents prefetch from starving `get_or_load` for adj_sem permits.
+///
+/// Two-level budget:
+///   pf_sem  → bounds max concurrent prefetch IOs (e.g., 4)
+///   adj_sem → bounds total IO depth (search + prefetch, e.g., 32)
+/// So search always has at least (adj_capacity - prefetch_budget) permits.
+async fn prefetch_one_read(
+    pool: std::rc::Rc<AdjacencyPool>,
+    io: std::rc::Rc<IoDriver>,
+    pf_sem: std::rc::Rc<crate::io::LocalSemaphore>,
+    pe: PrefetchEntry,
+) {
+    // Acquire prefetch budget permit first — if all budget slots are taken,
+    // this suspends until one frees up. Bounded by prefetch_budget (e.g., 4),
+    // not by channel size (16). No spawn storm.
+    let _pf_permit = pf_sem.acquire().await;
+
+    let slot_ptr = pool.slot_store.slot_ptr(pe.slot_idx);
+    match io.read_adj_block_direct(pe.vid, slot_ptr).await {
+        Ok(()) => {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[pe.slot_idx as usize];
+            if entry.vid == pe.vid && entry.load_gen == pe.load_gen
+                && entry.state == SlotState::Loading
+            {
+                entry.state = SlotState::Ready;
+                entry.waiters.wake_all();
+            }
+        }
+        Err(_) => {
+            // IO failed — roll back LOADING → EMPTY
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[pe.slot_idx as usize];
+            if entry.vid == pe.vid && entry.load_gen == pe.load_gen
+                && entry.state == SlotState::Loading
+            {
+                entry.reset();
+                entry.waiters.wake_all();
+            }
+        }
+    }
+    // _pf_permit drops here → releases one prefetch budget slot
+}
+
+/// Per-core prefetch worker. Consumes hints from the channel and spawns
+/// bounded IO tasks.
+///
+/// Each spawned task must acquire a permit from `pf_sem` before issuing IO.
+/// This limits active prefetch IOs to `prefetch_budget`, regardless of how
+/// many hints are queued. Excess tasks suspend on pf_sem until a slot frees.
+///
+/// Two-level backpressure:
+///   1. Channel capacity (16) — bounds how many hints can be queued
+///   2. pf_sem (prefetch_budget) — bounds how many IOs are in flight
+///   3. adj_sem — bounds total IO (search + prefetch)
+async fn prefetch_worker(
+    pool: std::rc::Rc<AdjacencyPool>,
+    io: std::rc::Rc<IoDriver>,
+    pf_sem: std::rc::Rc<crate::io::LocalSemaphore>,
+) {
+    loop {
+        // Wait for work or stop signal
+        let has_work = PrefetchWait { pool: &pool }.await;
+        if !has_work {
+            break;
+        }
+
+        // Drain all available entries, spawning a bounded task for each
+        loop {
+            let pe = {
+                let mut state = pool.state.borrow_mut();
+                state.prefetch.pop()
+            };
+            let pe = match pe {
+                Some(pe) => pe,
+                None => break,
+            };
+
+            monoio::spawn(prefetch_one_read(
+                std::rc::Rc::clone(&pool),
+                std::rc::Rc::clone(&io),
+                std::rc::Rc::clone(&pf_sem),
+                pe,
+            ));
+        }
     }
 }
 
@@ -568,9 +974,39 @@ impl<'a> Drop for LoadGuard<'a> {
         {
             entry.state = SlotState::Empty;
             entry.vid = u32::MAX;
-            if let Some(w) = entry.waiter.take() {
-                w.wake();
-            }
+            entry.waiters.wake_all();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// YieldOnce — cooperative yield point
+// ---------------------------------------------------------------------------
+
+/// Yields once to the executor, then completes on next poll.
+/// Used after WaitForReady to prevent spin-loops when waiter array
+/// overflows or gen mismatches cause immediate Ready return.
+struct YieldOnce {
+    yielded: bool,
+}
+
+impl YieldOnce {
+    fn new() -> Self {
+        Self { yielded: false }
+    }
+}
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.yielded {
+            Poll::Ready(())
+        } else {
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
 }
@@ -582,20 +1018,27 @@ impl<'a> Drop for LoadGuard<'a> {
 /// Awaits a LOADING entry to become READY (or detect that the flight is gone).
 /// Matches on (slot_idx, vid, load_gen) to detect stale flights.
 ///
-/// Only registers the first waker — subsequent polls don't overwrite,
-/// reducing unnecessary waker clones in the single-threaded executor.
+/// Uses `registered` flag to ensure each waiter pushes its waker exactly once,
+/// preventing unbounded growth from spurious wakes or repeated polling.
 ///
-/// Returns `()` always — gen mismatch / IO failure cause immediate return,
-/// caller re-probes. This is control flow, not an error.
+/// Returns `bool`:
+/// - `true` = successfully registered and was woken (normal dedup path)
+/// - `false` = returned immediately without sleeping (overflow, gen mismatch,
+///   or entry already transitioned). Caller should count these toward the
+///   overflow bypass limit.
 struct WaitForReady<'a> {
     pool: &'a AdjacencyPool,
     slot_idx: u32,
     vid: u32,
     load_gen: u32,
+    /// Only register waker once. Prevents duplicate push on spurious wake.
+    /// Reset is unnecessary — after wake_all the next poll sees Ready.
+    registered: bool,
 }
 
 impl<'a> Future for WaitForReady<'a> {
-    type Output = ();
+    /// `true` = actually waited (registered + woken), `false` = returned immediately.
+    type Output = bool;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -605,21 +1048,32 @@ impl<'a> Future for WaitForReady<'a> {
         // Check vid + gen match
         if entry.vid != this.vid || entry.load_gen != this.load_gen {
             // Flight gone (IO failed + reused, or evicted). Caller re-probes.
-            return Poll::Ready(());
+            return Poll::Ready(false);
         }
 
         match entry.state {
-            SlotState::Ready => Poll::Ready(()),
+            SlotState::Ready => {
+                // If we were registered, we were woken normally (true).
+                // If not registered, entry transitioned before we could wait (false).
+                Poll::Ready(this.registered)
+            }
             SlotState::Loading => {
-                // Only register first waker — don't overwrite existing
-                if entry.waiter.is_none() {
-                    entry.waiter = Some(cx.waker().clone());
+                if !this.registered {
+                    // First poll: register waker. If array is full, return
+                    // immediately — caller will yield then re-probe or bypass.
+                    if !entry.waiters.push(cx.waker().clone()) {
+                        return Poll::Ready(false); // overflow
+                    }
+                    this.registered = true;
                 }
+                // Subsequent polls (spurious wake): stay Pending, don't re-push.
+                // The waker registered on first poll is still in the array
+                // and will fire when wake_all runs.
                 Poll::Pending
             }
             SlotState::Empty => {
                 // IO failed, entry rolled back. Caller re-probes.
-                Poll::Ready(())
+                Poll::Ready(false)
             }
         }
     }
@@ -995,5 +1449,464 @@ mod tests {
             state.entries[base as usize].state = SlotState::Ready;
         }
         assert!(pool.is_resident(42));
+    }
+
+    /// Acceptance Gate 1: hit path cost.
+    ///
+    /// A cache hit (probe_set → CacheGuard → drop) must be cheap enough that
+    /// it's negligible next to a distance computation (~100-500ns for 768d).
+    /// Target: median < 100ns per hit cycle.
+    #[test]
+    fn acceptance_gate_hit_path_cost() {
+        let pool = make_pool(16); // 128 slots across 16 sets
+        let vid = 42u32;
+        let set_idx = pool.set_index(vid);
+        let base = pool.set_base(set_idx);
+
+        // Seed a READY entry
+        {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[base as usize];
+            entry.vid = vid;
+            entry.state = SlotState::Ready;
+            entry.referenced = false;
+            entry.pin_count = 0;
+        }
+
+        // Warmup
+        for _ in 0..1000 {
+            match pool.probe_set(vid) {
+                ProbeResult::Hit { slot_idx } => {
+                    let guard = CacheGuard {
+                        pool: &pool,
+                        slot_idx,
+                        bypass_buf: None,
+                    };
+                    let _data = guard.data();
+                    drop(guard);
+                }
+                _ => panic!("expected hit"),
+            }
+        }
+
+        // Measure
+        let iterations = 100_000u64;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            match pool.probe_set(vid) {
+                ProbeResult::Hit { slot_idx } => {
+                    let guard = CacheGuard {
+                        pool: &pool,
+                        slot_idx,
+                        bypass_buf: None,
+                    };
+                    let _data = guard.data();
+                    drop(guard);
+                }
+                _ => panic!("expected hit"),
+            }
+        }
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let per_hit_ns = elapsed_ns / iterations;
+
+        eprintln!(
+            "\n=== ACCEPTANCE GATE 1: Hit Path Cost ===\n\
+             iterations:   {}\n\
+             total:        {} us\n\
+             per hit:      {} ns\n\
+             target:       < 100 ns\n\
+             verdict:      {}",
+            iterations,
+            elapsed_ns / 1000,
+            per_hit_ns,
+            if per_hit_ns < 100 { "PASS" } else { "FAIL (but check: debug build adds overhead)" }
+        );
+
+        // In release mode, this should be < 50ns. In debug mode with bounds
+        // checks and RefCell overhead, allow up to 500ns.
+        assert!(
+            per_hit_ns < 500,
+            "hit path too slow: {} ns/hit (even debug build should be < 500ns)",
+            per_hit_ns
+        );
+    }
+
+    /// Acceptance gate: clock eviction stays bounded under full-set pressure.
+    ///
+    /// Fill a set to capacity, then repeatedly evict + insert new entries.
+    /// Verify that eviction cost per cycle stays bounded (no degradation).
+    #[test]
+    fn acceptance_gate_eviction_bounded_cost() {
+        let pool = make_pool(1); // single set, 8 ways
+
+        // Fill all 8 slots: READY, unreferenced, unpinned
+        {
+            let mut state = pool.state.borrow_mut();
+            for way in 0..SET_WAYS {
+                let entry = &mut state.entries[way as usize];
+                entry.vid = way;
+                entry.state = SlotState::Ready;
+                entry.referenced = false;
+                entry.pin_count = 0;
+            }
+        }
+
+        // Warmup
+        for vid in 100..200u32 {
+            if let Some(idx) = pool.find_or_evict(vid) {
+                let mut state = pool.state.borrow_mut();
+                let entry = &mut state.entries[idx as usize];
+                entry.vid = vid;
+                entry.state = SlotState::Ready;
+                entry.referenced = false;
+                entry.pin_count = 0;
+            }
+        }
+
+        // Measure: evict + replace cycles
+        let iterations = 50_000u64;
+        let start = std::time::Instant::now();
+        for i in 0..iterations {
+            let vid = 1000 + i as u32;
+            if let Some(idx) = pool.find_or_evict(vid) {
+                let mut state = pool.state.borrow_mut();
+                let entry = &mut state.entries[idx as usize];
+                entry.vid = vid;
+                entry.state = SlotState::Ready;
+                entry.referenced = false;
+                entry.pin_count = 0;
+            }
+        }
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let per_evict_ns = elapsed_ns / iterations;
+
+        eprintln!(
+            "\n=== ACCEPTANCE GATE: Eviction Bounded Cost ===\n\
+             iterations:   {}\n\
+             total:        {} us\n\
+             per evict:    {} ns\n\
+             target:       < 200 ns (8-way scan is O(16) max)\n\
+             verdict:      {}",
+            iterations,
+            elapsed_ns / 1000,
+            per_evict_ns,
+            if per_evict_ns < 200 { "PASS" } else { "FAIL (debug build overhead?)" }
+        );
+
+        assert!(
+            per_evict_ns < 1000,
+            "eviction too slow: {} ns/cycle (even debug should be < 1us)",
+            per_evict_ns
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: noop waker for manual polling
+    // -----------------------------------------------------------------------
+
+    fn noop_waker() -> Waker {
+        use std::task::RawWaker;
+        use std::task::RawWakerVTable;
+
+        fn noop(_: *const ()) {}
+        fn noop_clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(noop_clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    /// Gate 4: Repeated-poll stress — waker array doesn't grow from spurious wakes.
+    ///
+    /// Set up a LOADING entry, create N WaitForReady futures, poll each one
+    /// multiple times (simulating spurious wakes). The waiter array must stay
+    /// at exactly N entries (not N × polls).
+    #[test]
+    fn acceptance_gate_repeated_poll_no_growth() {
+        let pool = make_pool(1);
+        let vid = 42u32;
+        let set_idx = pool.set_index(vid);
+        let base = pool.set_base(set_idx);
+
+        // Set up a LOADING entry
+        {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[base as usize];
+            entry.vid = vid;
+            entry.state = SlotState::Loading;
+            entry.load_gen = 1;
+        }
+
+        let num_waiters = 3usize; // < MAX_WAITERS_PER_ENTRY
+        let polls_per_waiter = 50usize; // many spurious wakes
+
+        // Create WaitForReady futures and poll them repeatedly
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut futures: Vec<_> = (0..num_waiters)
+            .map(|_| WaitForReady {
+                pool: &pool,
+                slot_idx: base,
+                vid,
+                load_gen: 1,
+                registered: false,
+            })
+            .collect();
+
+        // Poll each future many times — simulates spurious wakes
+        for _round in 0..polls_per_waiter {
+            for f in futures.iter_mut() {
+                let pinned = Pin::new(f);
+                let result = pinned.poll(&mut cx);
+                assert_eq!(result, Poll::Pending, "should still be LOADING");
+            }
+        }
+
+        // Check: waiter array should have exactly num_waiters entries,
+        // NOT num_waiters × polls_per_waiter
+        {
+            let state = pool.state.borrow();
+            let entry = &state.entries[base as usize];
+            let waiter_count = entry.waiters.len();
+
+            eprintln!(
+                "\n=== GATE 4: Repeated-Poll No Growth ===\n\
+                 waiters:     {}\n\
+                 futures:     {}\n\
+                 polls/each:  {}\n\
+                 max capacity: {}\n\
+                 verdict:     {}",
+                waiter_count,
+                num_waiters,
+                polls_per_waiter,
+                MAX_WAITERS_PER_ENTRY,
+                if waiter_count == num_waiters { "PASS" } else { "FAIL" }
+            );
+
+            assert_eq!(
+                waiter_count, num_waiters,
+                "waiter array grew beyond registered count: {} (expected {})",
+                waiter_count, num_waiters
+            );
+        }
+
+        // Now transition to READY and wake all — futures should complete
+        {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[base as usize];
+            entry.state = SlotState::Ready;
+            entry.waiters.wake_all();
+        }
+
+        // Poll again — should all be Ready now
+        for f in futures.iter_mut() {
+            let pinned = Pin::new(f);
+            let result = pinned.poll(&mut cx);
+            assert_eq!(result, Poll::Ready(true), "should be Ready(true) after wake_all");
+        }
+
+        // Waiter array should be empty after wake_all
+        {
+            let state = pool.state.borrow();
+            let entry = &state.entries[base as usize];
+            assert_eq!(entry.waiters.len(), 0, "waiters should be empty after wake_all");
+        }
+    }
+
+    /// Gate 5: Cancel storm — dropping waiters mid-flight doesn't corrupt state.
+    ///
+    /// Create N waiters on a LOADING entry, drop half of them, then complete
+    /// the IO. Verify: no panics, waiter array is cleared, state is clean,
+    /// subsequent get_or_load probes work normally.
+    #[test]
+    fn acceptance_gate_cancel_storm() {
+        let pool = make_pool(1);
+        let vid = 42u32;
+        let set_idx = pool.set_index(vid);
+        let base = pool.set_base(set_idx);
+
+        // Set up LOADING entry
+        {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[base as usize];
+            entry.vid = vid;
+            entry.state = SlotState::Loading;
+            entry.load_gen = 1;
+        }
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Create 4 waiters (fills WaiterArray exactly)
+        let mut futures: Vec<_> = (0..MAX_WAITERS_PER_ENTRY)
+            .map(|_| WaitForReady {
+                pool: &pool,
+                slot_idx: base,
+                vid,
+                load_gen: 1,
+                registered: false,
+            })
+            .collect();
+
+        // Poll all to register
+        for f in futures.iter_mut() {
+            let pinned = Pin::new(f);
+            assert_eq!(pinned.poll(&mut cx), Poll::Pending);
+        }
+
+        // Verify all registered
+        {
+            let state = pool.state.borrow();
+            assert_eq!(
+                state.entries[base as usize].waiters.len(),
+                MAX_WAITERS_PER_ENTRY,
+                "all waiters should be registered"
+            );
+        }
+
+        // Drop half the futures (simulating timeout/abort)
+        let surviving = futures.split_off(MAX_WAITERS_PER_ENTRY / 2);
+        drop(futures); // dropped futures leave zombie wakers in array — that's OK
+
+        // Complete the IO: transition LOADING → READY, wake_all
+        {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[base as usize];
+            entry.state = SlotState::Ready;
+            entry.pin_count = 0;
+            entry.waiters.wake_all();
+        }
+
+        // Waiter array should be clear after wake_all
+        {
+            let state = pool.state.borrow();
+            let entry = &state.entries[base as usize];
+            assert_eq!(entry.waiters.len(), 0, "waiters should be empty after wake_all");
+        }
+
+        // Surviving futures should resolve cleanly
+        for mut f in surviving {
+            let pinned = Pin::new(&mut f);
+            let result = pinned.poll(&mut cx);
+            assert_eq!(result, Poll::Ready(true), "surviving waiter should see Ready(true)");
+        }
+
+        // State should be clean — subsequent probe_set should work
+        match pool.probe_set(vid) {
+            ProbeResult::Hit { slot_idx } => {
+                assert_eq!(slot_idx, base);
+                // Clean up: drop the guard
+                let guard = CacheGuard {
+                    pool: &pool,
+                    slot_idx,
+                    bypass_buf: None,
+                };
+                drop(guard);
+            }
+            other => panic!("expected Hit after cancel storm, got {:?}",
+                match other {
+                    ProbeResult::Miss => "Miss",
+                    ProbeResult::Loading { .. } => "Loading",
+                    ProbeResult::Hit { .. } => "Hit",
+                }
+            ),
+        }
+
+        // Also verify: a new LOADING cycle on the same slot works cleanly
+        {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[base as usize];
+            entry.state = SlotState::Loading;
+            entry.load_gen = entry.load_gen.wrapping_add(1);
+            // No stale waiters should be present
+            assert_eq!(entry.waiters.len(), 0);
+        }
+
+        eprintln!(
+            "\n=== GATE 5: Cancel Storm ===\n\
+             total waiters:     {}\n\
+             cancelled (dropped): {}\n\
+             survived:          {}\n\
+             state after:       clean (READY, no stale waiters)\n\
+             verdict:           PASS",
+            MAX_WAITERS_PER_ENTRY,
+            MAX_WAITERS_PER_ENTRY / 2,
+            MAX_WAITERS_PER_ENTRY - MAX_WAITERS_PER_ENTRY / 2,
+        );
+    }
+
+    /// Gate 4b: WaiterArray full — graceful degradation.
+    ///
+    /// If more than MAX_WAITERS_PER_ENTRY futures try to wait, the overflow
+    /// ones should get Poll::Ready (forcing re-probe), not panic or block.
+    #[test]
+    fn acceptance_gate_waiter_overflow() {
+        let pool = make_pool(1);
+        let vid = 42u32;
+        let set_idx = pool.set_index(vid);
+        let base = pool.set_base(set_idx);
+
+        {
+            let mut state = pool.state.borrow_mut();
+            let entry = &mut state.entries[base as usize];
+            entry.vid = vid;
+            entry.state = SlotState::Loading;
+            entry.load_gen = 1;
+        }
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Fill WaiterArray to capacity
+        let mut saturating: Vec<_> = (0..MAX_WAITERS_PER_ENTRY)
+            .map(|_| WaitForReady {
+                pool: &pool,
+                slot_idx: base,
+                vid,
+                load_gen: 1,
+                registered: false,
+            })
+            .collect();
+
+        for f in saturating.iter_mut() {
+            let pinned = Pin::new(f);
+            assert_eq!(pinned.poll(&mut cx), Poll::Pending);
+        }
+
+        // Now create one more — should get Poll::Ready (overflow, re-probe)
+        let mut overflow = WaitForReady {
+            pool: &pool,
+            slot_idx: base,
+            vid,
+            load_gen: 1,
+            registered: false,
+        };
+        let result = Pin::new(&mut overflow).poll(&mut cx);
+        assert_eq!(
+            result,
+            Poll::Ready(false),
+            "overflow waiter should get Ready(false) — not registered"
+        );
+
+        // Array should still have exactly MAX_WAITERS_PER_ENTRY entries
+        {
+            let state = pool.state.borrow();
+            assert_eq!(
+                state.entries[base as usize].waiters.len(),
+                MAX_WAITERS_PER_ENTRY
+            );
+        }
+
+        eprintln!(
+            "\n=== GATE 4b: WaiterArray Overflow ===\n\
+             capacity:         {}\n\
+             registered:       {}\n\
+             overflow result:  Ready (forced re-probe)\n\
+             verdict:          PASS",
+            MAX_WAITERS_PER_ENTRY,
+            MAX_WAITERS_PER_ENTRY,
+        );
     }
 }

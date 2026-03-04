@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use divergence_core::VectorId;
 
 /// A scored vector ID. Lower distance = better.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ScoredId {
     pub distance: f32,
     pub id: VectorId,
@@ -170,6 +170,20 @@ impl CandidateHeap {
         self.sift_up(self.data.len() - 1);
     }
 
+    /// Pop up to `buf.len()` nearest candidates into `buf`, then push them all back.
+    /// Returns the number of items written. O(n log N) — negligible at n<=8 in IO-bound loops.
+    /// Unlike raw heap-array slicing, this returns the *actual* nearest candidates.
+    pub fn peek_nearest(&mut self, buf: &mut [ScoredId]) -> usize {
+        let n = buf.len().min(self.data.len());
+        for i in 0..n {
+            buf[i] = self.pop().unwrap();
+        }
+        for i in 0..n {
+            self.push(buf[i]);
+        }
+        n
+    }
+
     /// Pop the nearest candidate. O(log n).
     pub fn pop(&mut self) -> Option<ScoredId> {
         if self.data.is_empty() {
@@ -277,5 +291,45 @@ mod tests {
         assert_eq!(heap.pop().unwrap().distance, 3.0);
         assert_eq!(heap.pop().unwrap().distance, 5.0);
         assert!(heap.pop().is_none());
+    }
+
+    #[test]
+    fn candidate_heap_peek_nearest() {
+        let mut heap = CandidateHeap::new();
+        heap.push(sid(5.0, 0));
+        heap.push(sid(1.0, 1));
+        heap.push(sid(3.0, 2));
+        heap.push(sid(2.0, 3));
+
+        // Peek top 2
+        let mut buf = [ScoredId::default(); 4];
+        let n = heap.peek_nearest(&mut buf[..2]);
+        assert_eq!(n, 2);
+        assert_eq!(buf[0].distance, 1.0);
+        assert_eq!(buf[1].distance, 2.0);
+
+        // Heap should still have all 4 items
+        assert_eq!(heap.pop().unwrap().distance, 1.0);
+        assert_eq!(heap.pop().unwrap().distance, 2.0);
+        assert_eq!(heap.pop().unwrap().distance, 3.0);
+        assert_eq!(heap.pop().unwrap().distance, 5.0);
+        assert!(heap.pop().is_none());
+    }
+
+    #[test]
+    fn candidate_heap_peek_nearest_larger_than_heap() {
+        let mut heap = CandidateHeap::new();
+        heap.push(sid(3.0, 0));
+        heap.push(sid(1.0, 1));
+
+        let mut buf = [ScoredId::default(); 8];
+        let n = heap.peek_nearest(&mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(buf[0].distance, 1.0);
+        assert_eq!(buf[1].distance, 3.0);
+
+        // Heap intact
+        assert_eq!(heap.pop().unwrap().distance, 1.0);
+        assert_eq!(heap.pop().unwrap().distance, 3.0);
     }
 }

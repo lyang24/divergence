@@ -54,6 +54,30 @@ pub struct SearchPerfContext {
     /// Exact-vector refinements (future: top-R re-ranking).
     pub refine_count: u64,
 
+    // --- Diagnostics (always on, near-zero overhead) ---
+    /// Expansions that added ≥1 neighbor to the beam.
+    pub useful_expansions: u64,
+    /// Expansions that added 0 neighbors (all visited or dominated).
+    pub wasted_expansions: u64,
+    /// Expansion number (1-indexed) at which the rank-1 result first entered the beam.
+    /// 0 means rank-1 result was a seed entry (came from entry_set, no expansion needed).
+    pub best_result_at_expansion: u64,
+    /// Expansion number at which the FIRST of the final top-k results entered the beam.
+    /// 0 means a seed entry was in the final top-k.
+    pub first_topk_at_expansion: u64,
+
+    // --- Prefetch diagnostics (always on) ---
+    /// Prefetch hints issued by the search loop.
+    pub prefetch_issued: u64,
+    /// Prefetch hints that resulted in cache hits (block was prefetched and used).
+    pub prefetch_consumed: u64,
+    /// Sum of inflight IO depth samples (sampled before each get_or_load).
+    pub inflight_sum: u64,
+    /// Number of inflight depth samples taken.
+    pub inflight_samples: u64,
+    /// Maximum inflight IO depth observed during this query.
+    pub inflight_max: u64,
+
     // --- Timers (PerfLevel::EnableTime) ---
     /// Wall-clock nanoseconds spent awaiting adjacency block loads.
     pub io_wait_ns: u64,
@@ -95,7 +119,7 @@ impl fmt::Display for SearchPerfContext {
             f,
             "blocks={} (hit={} miss={} dedup={}) dist_calls={} expand={} | \
              io={:.0}us ({:.0}%) dist={:.0}us ({:.0}%) overhead={:.0}us ({:.0}%) total={:.0}us | \
-             hit_rate={:.1}%",
+             hit_rate={:.1}% pf_iss={} pf_con={}",
             self.blocks_read,
             self.blocks_hit,
             self.blocks_miss,
@@ -110,6 +134,8 @@ impl fmt::Display for SearchPerfContext {
             overhead_pct,
             self.total_ns as f64 / 1000.0,
             hit_rate,
+            self.prefetch_issued,
+            self.prefetch_consumed,
         )
     }
 }
@@ -343,6 +369,31 @@ impl QueryRecorder {
         )
     }
 
+    /// Total latency p50 in microseconds.
+    pub fn p50_total_us(&self) -> f64 {
+        self.total_ns.borrow().p50() as f64 / 1000.0
+    }
+
+    /// Total latency p99 in microseconds.
+    pub fn p99_total_us(&self) -> f64 {
+        self.total_ns.borrow().p99() as f64 / 1000.0
+    }
+
+    /// Total latency p999 in microseconds.
+    pub fn p999_total_us(&self) -> f64 {
+        self.total_ns.borrow().p999() as f64 / 1000.0
+    }
+
+    /// Mean IO wait percentage (io_wait_ns / total_ns).
+    pub fn io_wait_pct(&self) -> f64 {
+        let total_mean = self.total_ns.borrow().mean();
+        if total_mean > 0.0 {
+            (self.io_wait_ns.borrow().mean() / total_mean) * 100.0
+        } else {
+            0.0
+        }
+    }
+
     /// Reset all histograms (for window boundary).
     pub fn reset(&self) {
         self.total_ns.borrow_mut().reset();
@@ -565,6 +616,15 @@ mod tests {
             expansions: 50,
             distance_computes: 500,
             refine_count: 0,
+            useful_expansions: 40,
+            wasted_expansions: 10,
+            best_result_at_expansion: 5,
+            first_topk_at_expansion: 1,
+            prefetch_issued: 0,
+            prefetch_consumed: 0,
+            inflight_sum: 0,
+            inflight_samples: 0,
+            inflight_max: 0,
             io_wait_ns: 200_000,
             compute_ns: 300_000,
             dist_ns: 250_000,
