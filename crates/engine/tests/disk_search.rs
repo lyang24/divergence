@@ -3291,9 +3291,10 @@ fn exp_p1_prefetch_latency_sweep() {
 
             let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
 
-            // Pool sized to ~25% of dataset blocks → forces cache misses
-            // on the measure pass. This makes prefetch meaningful even on tmpfs.
-            let pool_bytes = (n / 4) * 4096;
+            // Pool sized to ~5% of dataset blocks → forces heavy cache misses,
+            // making prefetch IO overlap visible even with warmup.
+            let pool_bytes = (n / 20) * 4096;
+            eprintln!("  Pool: {}KB ({:.0}% of {} blocks)", pool_bytes / 1024, pool_bytes as f64 / (n * 4096) as f64 * 100.0, n);
 
             for &w in &windows {
                 // Fresh pool per W to avoid cross-contamination
@@ -3307,8 +3308,8 @@ fn exp_p1_prefetch_latency_sweep() {
                     prefetch_budget,
                 );
 
-                // Warmup pass (populate cache, stabilize)
-                for q in &query_vecs {
+                // Warmup: 10 queries to partially fill cache (not full warmup)
+                for q in query_vecs.iter().take(10) {
                     let mut perf = SearchPerfContext::default();
                     disk_graph_search_pipe(
                         q, &entry_set, k, ef, w, &pool, &io, &bank,
@@ -3317,8 +3318,9 @@ fn exp_p1_prefetch_latency_sweep() {
                     .await;
                 }
 
-                // Measure pass
+                // Measure pass — collect raw wall-clock timings for precise percentiles
                 let mut recalls = Vec::with_capacity(num_queries);
+                let mut raw_us = Vec::with_capacity(num_queries);
                 let mut total_pf_iss = 0u64;
                 let mut total_pf_con = 0u64;
                 let mut total_wasted = 0u64;
@@ -3328,6 +3330,7 @@ fn exp_p1_prefetch_latency_sweep() {
                 let mut global_inflight_max = 0u64;
 
                 for (i, q) in query_vecs.iter().enumerate() {
+                    let t = std::time::Instant::now();
                     let mut guard = SearchGuard::new(&recorder, PerfLevel::EnableTime);
                     let lvl = guard.level();
                     let results = disk_graph_search_pipe(
@@ -3335,6 +3338,8 @@ fn exp_p1_prefetch_latency_sweep() {
                         &mut guard.ctx, lvl,
                     )
                     .await;
+                    let elapsed_us = t.elapsed().as_nanos() as f64 / 1000.0;
+                    raw_us.push(elapsed_us);
 
                     total_pf_iss += guard.ctx.prefetch_issued;
                     total_pf_con += guard.ctx.prefetch_consumed;
@@ -3364,13 +3369,19 @@ fn exp_p1_prefetch_latency_sweep() {
                     0.0
                 };
 
+                // Compute precise percentiles from raw wall-clock timings
+                raw_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50_raw = percentile(&raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 50.0);
+                let p99_raw = percentile(&raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 99.0);
+                let p999_raw = percentile(&raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 99.9);
+
                 eprintln!(
                     "{:<4} {:>7.3} {:>8.0} {:>8.0} {:>8.0} {:>8.1} {:>8.2} {:>8} {:>8} {:>8} {:>8.1}",
                     w,
                     mean_recall,
-                    recorder.p50_total_us(),
-                    recorder.p99_total_us(),
-                    recorder.p999_total_us(),
+                    p50_raw,
+                    p99_raw,
+                    p999_raw,
                     recorder.io_wait_pct(),
                     avg_inflight,
                     global_inflight_max,
