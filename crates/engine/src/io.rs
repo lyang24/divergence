@@ -1,16 +1,20 @@
-//! IO driver with separate adj/vec inflight budgets.
+//! IO driver with two-level inflight budgeting.
 //!
-//! IoDriver opens adjacency.dat (and optionally vectors.dat) with O_DIRECT
-//! and provides async read methods gated by per-category semaphores.
+//! Two-level IO budget:
+//!   1. GlobalIoBudget (atomic, cross-core) — caps total device queue depth
+//!   2. LocalSemaphore (per-core, RefCell) — caps per-core burst, provides async yield
 //!
-//! LocalSemaphore is a single-threaded async semaphore (no Send needed since
-//! monoio is thread-per-core).
+//! Every IO must acquire both: global token first, then local permit.
+//! This ensures the NVMe device queue stays within the sweet-spot QD
+//! regardless of how many cores are active.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -111,19 +115,112 @@ impl<'a> Drop for SemPermit<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// GlobalIoBudget — cross-core device queue depth cap
+// ---------------------------------------------------------------------------
+
+/// Global IO budget shared across all monoio cores. Caps total inflight IO
+/// to the NVMe device's sweet-spot queue depth (typically 12-16 for 4KB
+/// random reads on a single NVMe SSD).
+///
+/// Uses atomic CAS — no locks, no wakers, no cross-core coordination.
+/// Per-core waiters poll via yield when the global budget is exhausted.
+///
+/// Sizing guideline: set capacity to the QD where fio shows IOPS near-peak
+/// with p99 still acceptable. For i4i.2xlarge NVMe: QD=16.
+pub struct GlobalIoBudget {
+    available: AtomicUsize,
+    capacity: usize,
+}
+
+// Safety: AtomicUsize is Send+Sync.
+unsafe impl Send for GlobalIoBudget {}
+unsafe impl Sync for GlobalIoBudget {}
+
+impl GlobalIoBudget {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            available: AtomicUsize::new(capacity),
+            capacity,
+        }
+    }
+
+    /// Try to acquire one token. Returns true on success.
+    pub fn try_acquire(&self) -> bool {
+        let mut current = self.available.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.available.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(new) => current = new,
+            }
+        }
+    }
+
+    /// Release one token back to the pool.
+    pub fn release(&self) {
+        self.available.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn available(&self) -> usize {
+        self.available.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII global IO token — releases on drop.
+pub struct GlobalIoPermit<'a> {
+    budget: &'a GlobalIoBudget,
+}
+
+impl Drop for GlobalIoPermit<'_> {
+    fn drop(&mut self) {
+        self.budget.release();
+    }
+}
+
+/// Acquire a global IO token, yielding to the monoio event loop if none
+/// available. This lets io_uring CQE processing run (completing IOs and
+/// freeing tokens) between attempts.
+async fn acquire_global(budget: &GlobalIoBudget) -> GlobalIoPermit<'_> {
+    loop {
+        if budget.try_acquire() {
+            return GlobalIoPermit { budget };
+        }
+        // Yield to event loop — CQE completions release tokens.
+        monoio::time::sleep(std::time::Duration::from_micros(5)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IoDriver
 // ---------------------------------------------------------------------------
 
 /// Async IO driver for reading adjacency blocks from disk.
 ///
-/// Uses O_DIRECT for zero-copy NVMe reads. Inflight reads are bounded
-/// by the adjacency semaphore.
+/// Two-level inflight budget:
+///   1. `global_budget` (optional, Arc<GlobalIoBudget>) — device-wide QD cap
+///   2. `adj_sem` (per-core LocalSemaphore) — per-core burst cap
+///
+/// If global_budget is None, only the local adj_sem controls inflight depth.
+/// This is the single-core / test mode.
 pub struct IoDriver {
     adj_file: File,
     adj_sem: LocalSemaphore,
     adj_capacity: usize,
     dimension: usize,
-    /// Cumulative nanoseconds spent waiting for adj_sem permits (queue wait).
+    /// Cross-core global IO budget. None = single-core / test mode.
+    global_budget: Option<Arc<GlobalIoBudget>>,
+    /// Cumulative nanoseconds spent waiting for global + local permits.
     sem_wait_ns: Cell<u64>,
     /// Cumulative nanoseconds spent in actual NVMe reads (device time).
     device_ns: Cell<u64>,
@@ -135,11 +232,23 @@ impl IoDriver {
     /// Open index files for async reading.
     ///
     /// `direct_io`: set to false for tmpfs/tests (O_DIRECT doesn't work on tmpfs).
+    /// `global_budget`: shared device-level QD cap. None for single-core / tests.
     pub async fn open(
         index_dir: &str,
         dimension: usize,
         adj_inflight: usize,
         direct_io: bool,
+    ) -> io::Result<Self> {
+        Self::open_with_budget(index_dir, dimension, adj_inflight, direct_io, None).await
+    }
+
+    /// Open with explicit global IO budget.
+    pub async fn open_with_budget(
+        index_dir: &str,
+        dimension: usize,
+        adj_inflight: usize,
+        direct_io: bool,
+        global_budget: Option<Arc<GlobalIoBudget>>,
     ) -> io::Result<Self> {
         let adj_path = format!("{}/adjacency.dat", index_dir);
 
@@ -156,6 +265,7 @@ impl IoDriver {
             adj_sem: LocalSemaphore::new(adj_inflight),
             adj_capacity: adj_inflight,
             dimension,
+            global_budget,
             sem_wait_ns: Cell::new(0),
             device_ns: Cell::new(0),
             io_count: Cell::new(0),
@@ -163,9 +273,14 @@ impl IoDriver {
     }
 
     /// Read one 4KB adjacency block for the given vector ID.
-    /// Acquires a semaphore permit, reads, releases on return.
+    /// Acquires global budget token (if configured) + local semaphore permit.
     pub async fn read_adj_block(&self, vid: u32) -> io::Result<AlignedBuf> {
         let t0 = Instant::now();
+        // Two-level acquire: global device QD cap first, then per-core limit
+        let _global = match &self.global_budget {
+            Some(gb) => Some(acquire_global(gb).await),
+            None => None,
+        };
         let _permit = self.adj_sem.acquire().await;
         let t1 = Instant::now();
 
@@ -187,6 +302,7 @@ impl IoDriver {
             ));
         }
         Ok(buf)
+        // _permit and _global drop here → release both levels
     }
 
     /// Read one 4KB adjacency block directly into a SlotPtr buffer.
@@ -200,6 +316,11 @@ impl IoDriver {
         dst: crate::cache::SlotPtr,
     ) -> io::Result<()> {
         let t0 = Instant::now();
+        // Two-level acquire: global device QD cap first, then per-core limit
+        let _global = match &self.global_budget {
+            Some(gb) => Some(acquire_global(gb).await),
+            None => None,
+        };
         let _permit = self.adj_sem.acquire().await;
         let t1 = Instant::now();
 
@@ -223,6 +344,7 @@ impl IoDriver {
             ));
         }
         Ok(())
+        // _permit and _global drop here → release both levels
     }
 
     pub fn dimension(&self) -> usize {
