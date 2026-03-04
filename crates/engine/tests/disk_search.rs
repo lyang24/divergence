@@ -3274,8 +3274,8 @@ fn exp_p1_prefetch_latency_sweep() {
         .chunks_exact(dim).take(num_queries).map(|c| c.to_vec()).collect();
 
     eprintln!(
-        "\n{:<4} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "W", "r@k", "p50us", "p99us", "p999us", "io_w%", "avg_ifl", "max_ifl", "pf_iss", "pf_con", "waste%"
+        "\n{:<4} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>6} {:>8} {:>8} {:>8}",
+        "W", "r@k", "p50us", "p99us", "p999us", "io_w%", "avg_ifl", "max_ifl", "blk/q", "mis/q", "pf_iss", "pf_con", "waste%"
     );
 
     let mut baseline_recall = 0.0f64;
@@ -3328,6 +3328,8 @@ fn exp_p1_prefetch_latency_sweep() {
                 let mut total_inflight_sum = 0u64;
                 let mut total_inflight_samples = 0u64;
                 let mut global_inflight_max = 0u64;
+                let mut total_blocks_read = 0u64;
+                let mut total_blocks_miss = 0u64;
 
                 for (i, q) in query_vecs.iter().enumerate() {
                     let t = std::time::Instant::now();
@@ -3350,6 +3352,8 @@ fn exp_p1_prefetch_latency_sweep() {
                     if guard.ctx.inflight_max > global_inflight_max {
                         global_inflight_max = guard.ctx.inflight_max;
                     }
+                    total_blocks_read += guard.ctx.blocks_read;
+                    total_blocks_miss += guard.ctx.blocks_miss;
 
                     let result_ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
                     recalls.push(recall_at_k(&result_ids, &ground_truth[i]));
@@ -3375,8 +3379,11 @@ fn exp_p1_prefetch_latency_sweep() {
                 let p99_raw = percentile(&raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 99.0);
                 let p999_raw = percentile(&raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(), 99.9);
 
+                let blk_per_q = total_blocks_read as f64 / num_queries as f64;
+                let miss_per_q = total_blocks_miss as f64 / num_queries as f64;
+
                 eprintln!(
-                    "{:<4} {:>7.3} {:>8.0} {:>8.0} {:>8.0} {:>8.1} {:>8.2} {:>8} {:>8} {:>8} {:>8.1}",
+                    "{:<4} {:>7.3} {:>8.0} {:>8.0} {:>8.0} {:>8.1} {:>8.2} {:>8} {:>6.0} {:>6.0} {:>8} {:>8} {:>8.1}",
                     w,
                     mean_recall,
                     p50_raw,
@@ -3385,6 +3392,8 @@ fn exp_p1_prefetch_latency_sweep() {
                     recorder.io_wait_pct(),
                     avg_inflight,
                     global_inflight_max,
+                    blk_per_q,
+                    miss_per_q,
                     total_pf_iss,
                     total_pf_con,
                     waste_pct,
@@ -3417,5 +3426,273 @@ fn exp_p1_prefetch_latency_sweep() {
     eprintln!("\nBaseline recall (W=0): {:.3}", baseline_recall);
     eprintln!("All W values within 1% of baseline recall — PASS");
     eprintln!("NOTE: tmpfs (memcpy IO) — latency/inflight numbers only meaningful on real NVMe with O_DIRECT");
+}
+
+// ---------------------------------------------------------------------------
+// EXP-BW: B×W overlap sweep — inter-query concurrency × prefetch window
+// ---------------------------------------------------------------------------
+
+/// Sweep (B, W) to find the optimal operating point for throughput vs tail latency.
+///
+/// B = number of concurrent queries per batch (inter-query parallelism).
+/// W = prefetch window per query (intra-query IO pipeline).
+///
+/// All B queries in a batch share the same AdjacencyPool and IoDriver (via Rc).
+/// Measures QPS, per-query p50/p99, recall.
+///
+/// Run: BENCH_DIR=/mnt/nvme/bench COHERE_N=100000 cargo test --release \
+///   -p divergence-engine --test disk_search exp_bw -- --nocapture
+#[test]
+fn exp_bw_overlap_sweep() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let ef = 200;
+    let num_queries = nq.min(100);
+    let prefetch_budget = 4;
+    let b_values = [1usize, 2, 4, 8];
+    let w_values = [0usize, 2, 4];
+
+    eprintln!("\n========== EXP-BW: B×W OVERLAP SWEEP ==========");
+    eprintln!(
+        "n={}, dim={}, k={}, ef={}, nq={}, pf_budget={}",
+        n, dim, k, ef, num_queries, prefetch_budget
+    );
+
+    // Build NSW index
+    eprintln!("Building NSW index (m_max={}, ef_c={}) ...", m_max, ef_construction);
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for i in 0..n {
+        builder.insert(VectorId(i as u32), &vectors[i * dim..(i + 1) * dim]);
+    }
+    let index = builder.build();
+    eprintln!("  Index built");
+
+    // Write to disk (BENCH_DIR for NVMe, tmpfs otherwise)
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let dir_path: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        dir_path = std::path::PathBuf::from(bd);
+        std::fs::create_dir_all(&dir_path).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        dir_path = _tmpdir.path().to_path_buf();
+    }
+    let dir_str = dir_path.to_str().unwrap().to_owned();
+    let writer = IndexWriter::new(&dir_path);
+    writer
+        .write(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+            index.vectors_raw(), |vid| index.neighbors(vid),
+        )
+        .unwrap();
+    eprintln!("  Index written to {} (direct_io={})", dir_str, direct_io);
+
+    let disk_vectors = load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap();
+    let entry_set: Vec<VectorId> = {
+        let meta = IndexMeta::load_from(&dir_path.join("meta.json")).unwrap();
+        meta.entry_set.iter().map(|&v| VectorId(v)).collect()
+    };
+
+    let query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim)
+        .take(num_queries)
+        .map(|c| c.to_vec())
+        .collect();
+
+    eprintln!(
+        "\n{:<4} {:<4} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>6}",
+        "B", "W", "r@k", "qps", "p50us", "p99us", "p999us", "io_w%", "avg_ifl", "blk/q", "mis/q"
+    );
+
+    let mut baseline_recall = 0.0f64;
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let io = Rc::new(
+                IoDriver::open(&dir_str, dim, 64, direct_io)
+                    .await
+                    .expect("failed to open IO driver"),
+            );
+
+            // Rc-wrap vectors so spawned tasks can create their own bank
+            let vecs_rc: Rc<[f32]> = Rc::from(disk_vectors.as_slice());
+            let entry_set_rc: Rc<[VectorId]> = Rc::from(entry_set.as_slice());
+
+            // Pool sized to ~5% of dataset blocks
+            let pool_bytes = (n / 20) * 4096;
+            eprintln!(
+                "  Pool: {}KB ({:.0}% of {} blocks)",
+                pool_bytes / 1024,
+                pool_bytes as f64 / (n * 4096) as f64 * 100.0,
+                n
+            );
+
+            for &b in &b_values {
+                for &w in &w_values {
+                    // Fresh pool per (B, W) to avoid cross-contamination
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+
+                    // Spawn prefetch worker
+                    let pf_handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool),
+                        Rc::clone(&io),
+                        prefetch_budget,
+                    );
+
+                    // Light warmup (10 sequential queries)
+                    let warmup_bank = FP32SimdVectorBank::new(&vecs_rc, dim, MetricType::Cosine);
+                    for q in query_vecs.iter().take(10) {
+                        let mut perf = SearchPerfContext::default();
+                        disk_graph_search_pipe(
+                            q, &entry_set_rc, k, ef, w, &pool, &io, &warmup_bank,
+                            &mut perf, PerfLevel::CountOnly,
+                        )
+                        .await;
+                    }
+                    drop(warmup_bank);
+
+                    // Measure pass: ceil(nq / B) batches of B concurrent queries
+                    let mut raw_us: Vec<f64> = Vec::with_capacity(num_queries);
+                    let mut recalls: Vec<f64> = Vec::with_capacity(num_queries);
+                    let mut total_blocks_read = 0u64;
+                    let mut total_blocks_miss = 0u64;
+                    let mut total_inflight_sum = 0u64;
+                    let mut total_inflight_samples = 0u64;
+                    let mut total_io_wait_ns = 0u64;
+                    let mut total_total_ns = 0u64;
+
+                    let wall_start = std::time::Instant::now();
+                    let num_batches = (num_queries + b - 1) / b;
+
+                    for batch_idx in 0..num_batches {
+                        let batch_start = batch_idx * b;
+                        let batch_end = (batch_start + b).min(num_queries);
+                        let batch_size = batch_end - batch_start;
+
+                        // Spawn B concurrent search tasks
+                        let mut handles = Vec::with_capacity(batch_size);
+                        for qi in batch_start..batch_end {
+                            let pool_c = Rc::clone(&pool);
+                            let io_c = Rc::clone(&io);
+                            let vecs_c = Rc::clone(&vecs_rc);
+                            let es_c = Rc::clone(&entry_set_rc);
+                            let q = query_vecs[qi].clone();
+
+                            handles.push(monoio::spawn(async move {
+                                let bank = FP32SimdVectorBank::new(&vecs_c, dim, MetricType::Cosine);
+                                let mut perf = SearchPerfContext::default();
+                                let t = std::time::Instant::now();
+                                let results = disk_graph_search_pipe(
+                                    &q, &es_c, k, ef, w, &pool_c, &io_c,
+                                    &bank, &mut perf, PerfLevel::EnableTime,
+                                )
+                                .await;
+                                let elapsed_us = t.elapsed().as_nanos() as f64 / 1000.0;
+                                (results, perf, elapsed_us)
+                            }));
+                        }
+
+                        // Await all B tasks in this batch
+                        for (j, h) in handles.into_iter().enumerate() {
+                            let (results, perf, elapsed_us) = h.await;
+                            raw_us.push(elapsed_us);
+                            total_blocks_read += perf.blocks_read;
+                            total_blocks_miss += perf.blocks_miss;
+                            total_inflight_sum += perf.inflight_sum;
+                            total_inflight_samples += perf.inflight_samples;
+                            total_io_wait_ns += perf.io_wait_ns;
+                            total_total_ns += perf.io_wait_ns + perf.compute_ns;
+
+                            let qi = batch_start + j;
+                            let result_ids: Vec<u32> =
+                                results.iter().map(|s| s.id.0).collect();
+                            recalls.push(recall_at_k(&result_ids, &ground_truth[qi]));
+                        }
+                    }
+
+                    let wall_secs = wall_start.elapsed().as_secs_f64();
+                    let qps = num_queries as f64 / wall_secs;
+
+                    // Stop prefetch worker
+                    pool.stop_prefetch();
+                    pf_handle.await;
+
+                    // Compute stats
+                    let mean_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+                    raw_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let p50 = percentile(
+                        &raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                        50.0,
+                    );
+                    let p99 = percentile(
+                        &raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                        99.0,
+                    );
+                    let p999 = percentile(
+                        &raw_us.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                        99.9,
+                    );
+
+                    let io_wait_pct = if total_total_ns > 0 {
+                        total_io_wait_ns as f64 / total_total_ns as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    let avg_ifl = if total_inflight_samples > 0 {
+                        total_inflight_sum as f64 / total_inflight_samples as f64
+                    } else {
+                        0.0
+                    };
+                    let blk_per_q = total_blocks_read as f64 / num_queries as f64;
+                    let miss_per_q = total_blocks_miss as f64 / num_queries as f64;
+
+                    eprintln!(
+                        "{:<4} {:<4} {:>7.3} {:>8.1} {:>8.0} {:>8.0} {:>8.0} {:>8.1} {:>8.2} {:>6.0} {:>6.0}",
+                        b,
+                        w,
+                        mean_recall,
+                        qps,
+                        p50,
+                        p99,
+                        p999,
+                        io_wait_pct,
+                        avg_ifl,
+                        blk_per_q,
+                        miss_per_q,
+                    );
+
+                    if b == 1 && w == 0 {
+                        baseline_recall = mean_recall;
+                    }
+                }
+            }
+        });
+    }) {
+        eprintln!("SKIPPED: io_uring not available");
+        return;
+    }
+
+    eprintln!("\nBaseline recall (B=1,W=0): {:.3}", baseline_recall);
+    eprintln!("B×W sweep complete");
 }
 
