@@ -201,6 +201,14 @@ async fn acquire_global(budget: &GlobalIoBudget) -> GlobalIoPermit<'_> {
     }
 }
 
+/// Default global queue depth for production use.
+///
+/// Rule from AD-6: `max(16, 4 × cores)`. Below the knee, sem_wait% spikes
+/// and p99 explodes. Over-provisioning is harmless.
+pub fn default_global_qd(num_cores: usize) -> usize {
+    16usize.max(4 * num_cores)
+}
+
 // ---------------------------------------------------------------------------
 // IoDriver
 // ---------------------------------------------------------------------------
@@ -359,6 +367,12 @@ impl IoDriver {
     /// Number of adjacency IO permits currently available.
     pub fn available_adj_permits(&self) -> usize {
         self.adj_sem.available()
+    }
+
+    /// Current global inflight depth: `capacity - available`.
+    /// Returns `None` if no global budget is configured (single-core / test mode).
+    pub fn global_inflight(&self) -> Option<usize> {
+        self.global_budget.as_ref().map(|gb| gb.capacity() - gb.available())
     }
 
     /// Snapshot and reset IO timing counters. Returns (sem_wait_ns, device_ns, io_count).

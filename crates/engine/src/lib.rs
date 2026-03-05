@@ -7,7 +7,7 @@ pub mod search;
 
 pub use aligned::AlignedBuf;
 pub use cache::{AdjacencyPool, CacheGuard, CacheStatsSnapshot};
-pub use io::{GlobalIoBudget, IoDriver};
+pub use io::{GlobalIoBudget, IoDriver, default_global_qd};
 pub use perf::{
     Histogram, PerfLevel, QueryRecorder, SchedLagTracker, SearchGuard, SearchPerfContext,
 };
