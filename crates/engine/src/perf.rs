@@ -78,6 +78,22 @@ pub struct SearchPerfContext {
     /// Maximum inflight IO depth observed during this query.
     pub inflight_max: u64,
 
+    // --- Global inflight diagnostics (always on, only when GlobalIoBudget configured) ---
+    /// Sum of global inflight depth samples (sampled before each get_or_load).
+    pub global_inflight_sum: u64,
+    /// Number of global inflight depth samples taken.
+    pub global_inflight_samples: u64,
+    /// Maximum global inflight depth observed during this query.
+    pub global_inflight_max: u64,
+
+    // --- Adaptive stopping diagnostics (always on) ---
+    /// Whether this query was stopped early by the stall detector.
+    pub stopped_early: bool,
+    /// Number of consecutive stalls when search ended.
+    pub consecutive_stalls_at_end: u64,
+    /// Expansion count at which search stopped (0 if not stopped early).
+    pub expansions_at_stop: u64,
+
     // --- Timers (PerfLevel::EnableTime) ---
     /// Wall-clock nanoseconds spent awaiting adjacency block loads.
     pub io_wait_ns: u64,
@@ -136,7 +152,11 @@ impl fmt::Display for SearchPerfContext {
             hit_rate,
             self.prefetch_issued,
             self.prefetch_consumed,
-        )
+        )?;
+        if self.stopped_early {
+            write!(f, " | STOPPED@{} stalls={}", self.expansions_at_stop, self.consecutive_stalls_at_end)?;
+        }
+        Ok(())
     }
 }
 
@@ -274,6 +294,10 @@ pub struct QueryRecorder {
     overhead_ns: RefCell<Histogram>,
     blocks_read: RefCell<Histogram>,
     distance_computes: RefCell<Histogram>,
+    /// Per-query average local inflight depth histogram.
+    inflight_local: RefCell<Histogram>,
+    /// Per-query average global inflight depth histogram.
+    inflight_global: RefCell<Histogram>,
     query_count: Cell<u64>,
 }
 
@@ -286,6 +310,8 @@ impl QueryRecorder {
             overhead_ns: RefCell::new(Histogram::new()),
             blocks_read: RefCell::new(Histogram::new()),
             distance_computes: RefCell::new(Histogram::new()),
+            inflight_local: RefCell::new(Histogram::new()),
+            inflight_global: RefCell::new(Histogram::new()),
             query_count: Cell::new(0),
         }
     }
@@ -302,6 +328,15 @@ impl QueryRecorder {
         self.distance_computes
             .borrow_mut()
             .record(ctx.distance_computes);
+        // Record per-query average inflight depths
+        if ctx.inflight_samples > 0 {
+            let avg_local = ctx.inflight_sum / ctx.inflight_samples;
+            self.inflight_local.borrow_mut().record(avg_local);
+        }
+        if ctx.global_inflight_samples > 0 {
+            let avg_global = ctx.global_inflight_sum / ctx.global_inflight_samples;
+            self.inflight_global.borrow_mut().record(avg_global);
+        }
         self.query_count.set(self.query_count.get() + 1);
     }
 
@@ -317,6 +352,8 @@ impl QueryRecorder {
         let overhead = self.overhead_ns.borrow();
         let blocks = self.blocks_read.borrow();
         let dists = self.distance_computes.borrow();
+        let ifl_local = self.inflight_local.borrow();
+        let ifl_global = self.inflight_global.borrow();
 
         let io_pct = if total.mean() > 0.0 {
             (io.mean() / total.mean()) * 100.0
@@ -334,7 +371,7 @@ impl QueryRecorder {
             0.0
         };
 
-        format!(
+        let mut s = format!(
             "Queries: {}\n\
              Latency (us):  p50={:.0}  p99={:.0}  p999={:.0}  mean={:.0}  max={:.0}\n\
              IO wait (us):  p50={:.0}  p99={:.0}  mean={:.0}  ({:.0}% of total)\n\
@@ -366,7 +403,22 @@ impl QueryRecorder {
             dists.p50(),
             dists.p99(),
             dists.mean(),
-        )
+        );
+
+        if ifl_local.count() > 0 {
+            s.push_str(&format!(
+                "\nInflight local: p50={}  p99={}  mean={:.1}  max={}",
+                ifl_local.p50(), ifl_local.p99(), ifl_local.mean(), ifl_local.max_val(),
+            ));
+        }
+        if ifl_global.count() > 0 {
+            s.push_str(&format!(
+                "\nInflight global: p50={}  p99={}  mean={:.1}  max={}",
+                ifl_global.p50(), ifl_global.p99(), ifl_global.mean(), ifl_global.max_val(),
+            ));
+        }
+
+        s
     }
 
     /// Total latency p50 in microseconds.
@@ -382,6 +434,16 @@ impl QueryRecorder {
     /// Total latency p999 in microseconds.
     pub fn p999_total_us(&self) -> f64 {
         self.total_ns.borrow().p999() as f64 / 1000.0
+    }
+
+    /// Mean per-query average global inflight depth.
+    pub fn global_inflight_mean(&self) -> f64 {
+        self.inflight_global.borrow().mean()
+    }
+
+    /// Max per-query average global inflight depth.
+    pub fn global_inflight_max(&self) -> u64 {
+        self.inflight_global.borrow().max_val()
     }
 
     /// Mean IO wait percentage (io_wait_ns / total_ns).
@@ -402,6 +464,8 @@ impl QueryRecorder {
         self.overhead_ns.borrow_mut().reset();
         self.blocks_read.borrow_mut().reset();
         self.distance_computes.borrow_mut().reset();
+        self.inflight_local.borrow_mut().reset();
+        self.inflight_global.borrow_mut().reset();
         self.query_count.set(0);
     }
 }
@@ -625,6 +689,12 @@ mod tests {
             inflight_sum: 0,
             inflight_samples: 0,
             inflight_max: 0,
+            global_inflight_sum: 0,
+            global_inflight_samples: 0,
+            global_inflight_max: 0,
+            stopped_early: false,
+            consecutive_stalls_at_end: 0,
+            expansions_at_stop: 0,
             io_wait_ns: 200_000,
             compute_ns: 300_000,
             dist_ns: 250_000,
@@ -696,6 +766,41 @@ mod tests {
         assert!(report.contains("Queries: 10"));
         assert!(report.contains("Blocks/query:"));
         assert!(report.contains("Dists/query:"));
+    }
+
+    #[test]
+    fn query_recorder_inflight_histograms() {
+        let recorder = QueryRecorder::new();
+        {
+            let mut guard = SearchGuard::new(&recorder, PerfLevel::CountOnly);
+            // Simulate local inflight: avg = 120/40 = 3
+            guard.ctx.inflight_sum = 120;
+            guard.ctx.inflight_samples = 40;
+            guard.ctx.inflight_max = 5;
+            // Simulate global inflight: avg = 400/40 = 10
+            guard.ctx.global_inflight_sum = 400;
+            guard.ctx.global_inflight_samples = 40;
+            guard.ctx.global_inflight_max = 16;
+        }
+        assert_eq!(recorder.query_count(), 1);
+        assert!(recorder.global_inflight_mean() > 0.0);
+        let report = recorder.report();
+        assert!(report.contains("Inflight local:"), "report missing local inflight: {}", report);
+        assert!(report.contains("Inflight global:"), "report missing global inflight: {}", report);
+    }
+
+    #[test]
+    fn query_recorder_inflight_no_samples() {
+        let recorder = QueryRecorder::new();
+        {
+            let mut guard = SearchGuard::new(&recorder, PerfLevel::CountOnly);
+            guard.ctx.blocks_read = 10;
+            // No inflight samples → histograms should stay empty
+        }
+        assert_eq!(recorder.query_count(), 1);
+        assert_eq!(recorder.global_inflight_mean(), 0.0);
+        let report = recorder.report();
+        assert!(!report.contains("Inflight"), "should not print inflight with no samples");
     }
 
     #[test]

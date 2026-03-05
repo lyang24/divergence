@@ -396,14 +396,16 @@ pub async fn disk_graph_search_refine(
     candidates
 }
 
-/// Async beam search with intra-query prefetch pipeline.
+/// Async beam search with intra-query prefetch pipeline and adaptive stopping.
 ///
-/// Clone of `disk_graph_search` with one addition: before each `get_or_load`,
-/// peeks ahead into the candidate heap and issues `prefetch_hint()` for the
-/// next `prefetch_window` nearest candidates. The prefetch worker (spawned
-/// separately by the caller) issues the IO reads in background.
-///
-/// `prefetch_window=0` disables prefetching (equivalent to `disk_graph_search`).
+/// Clone of `disk_graph_search` with two additions:
+/// 1. **Prefetch**: before each `get_or_load`, peeks ahead into the candidate
+///    heap and issues `prefetch_hint()` for the next `prefetch_window` nearest
+///    candidates. `prefetch_window=0` disables prefetching.
+/// 2. **Adaptive stopping**: when the top-k boundary stops improving for
+///    `stall_limit` consecutive expansions, enters DRAIN mode (allows
+///    `drain_budget` more expansions). If no improvement during DRAIN, stops
+///    early. `stall_limit=0` disables adaptive stopping (current behavior).
 ///
 /// Does NOT spawn or stop the prefetch worker — caller manages worker lifecycle.
 pub async fn disk_graph_search_pipe(
@@ -412,6 +414,8 @@ pub async fn disk_graph_search_pipe(
     k: usize,
     ef: usize,
     prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
     pool: &AdjacencyPool,
     io: &IoDriver,
     bank: &dyn VectorBank,
@@ -451,6 +455,11 @@ pub async fn disk_graph_search_pipe(
     // Lookahead buffer for prefetch (stack-allocated, max 8)
     let mut lookahead = [ScoredId::default(); 8];
 
+    // Adaptive stopping state
+    let mut consecutive_stalls: u64 = 0;
+    let mut prev_furthest: f32 = f32::MAX;
+    let mut drain_remaining: u32 = 0;
+
     // Beam search: expand candidates by reading adjacency blocks from disk
     while let Some(candidate) = candidates.pop() {
         if let Some(furthest) = nearest.furthest() {
@@ -482,6 +491,15 @@ pub async fn disk_graph_search_pipe(
         perf.inflight_samples += 1;
         if inflight > perf.inflight_max {
             perf.inflight_max = inflight;
+        }
+
+        // Sample global inflight depth (cross-core device QD)
+        if let Some(g) = io.global_inflight() {
+            perf.global_inflight_sum += g as u64;
+            perf.global_inflight_samples += 1;
+            if g as u64 > perf.global_inflight_max {
+                perf.global_inflight_max = g as u64;
+            }
         }
 
         // ← yield point: get adjacency block (cache hit = sync, miss = async IO)
@@ -546,6 +564,45 @@ pub async fn disk_graph_search_pipe(
         }
 
         drop(guard); // unpin after processing neighbors
+
+        // Adaptive stopping: track top-k boundary convergence
+        if stall_limit > 0 && nearest.len() >= ef {
+            let cur = nearest.furthest().unwrap().distance;
+            if cur < prev_furthest {
+                // Improvement — reset stall counter and exit drain
+                consecutive_stalls = 0;
+                prev_furthest = cur;
+                drain_remaining = 0;
+            } else {
+                consecutive_stalls += 1;
+            }
+
+            if drain_remaining > 0 {
+                drain_remaining -= 1;
+                if drain_remaining == 0 {
+                    // DRAIN exhausted with no improvement → stop
+                    perf.stopped_early = true;
+                    perf.consecutive_stalls_at_end = consecutive_stalls;
+                    perf.expansions_at_stop = perf.expansions;
+                    break;
+                }
+            } else if consecutive_stalls >= stall_limit as u64 {
+                // Enter DRAIN mode
+                drain_remaining = drain_budget;
+                if drain_budget == 0 {
+                    // No drain budget → stop immediately
+                    perf.stopped_early = true;
+                    perf.consecutive_stalls_at_end = consecutive_stalls;
+                    perf.expansions_at_stop = perf.expansions;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Record final stall state even if not stopped early
+    if !perf.stopped_early {
+        perf.consecutive_stalls_at_end = consecutive_stalls;
     }
 
     // Compute cache stats delta for this query
