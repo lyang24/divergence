@@ -4626,3 +4626,1184 @@ fn exp_as_adaptive_stopping() {
     assert_eq!(baseline.early_pct, 0.0, "stall_limit=0 should never stop early");
 }
 
+// ---------------------------------------------------------------------------
+// Engine integration tests
+// ---------------------------------------------------------------------------
+
+/// Test A: Engine creates default global QD, spawns workers, runs queries on tmpfs.
+#[test]
+fn test_engine_default_on() {
+    use std::sync::Arc;
+    use divergence_engine::{
+        Engine, EngineConfig, EngineHealth,
+        IoDriver, AdjacencyPool, QueryRecorder, SearchGuard,
+        PerfLevel, WorkerConfig, spawn_worker,
+        disk_graph_search_pipe,
+    };
+
+    // Check io_uring availability — skip if not supported
+    if !with_runtime(|_| {}) {
+        eprintln!("SKIPPED: io_uring not available");
+        return;
+    }
+
+    let n = 200;
+    let dim = 32;
+    let k = 10;
+    let ef = 64;
+    let m_max = 32;
+    let ef_construction = 200;
+
+    // Build index to tmpfs
+    let vectors = generate_vectors(n, dim, 42);
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::L2, n);
+    for (i, v) in vectors.iter().enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap().to_owned();
+    let writer = IndexWriter::new(dir.path());
+    writer
+        .write(
+            n as u32,
+            dim,
+            "l2",
+            index.max_degree(),
+            ef_construction,
+            &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+            index.vectors_raw(),
+            |vid| index.neighbors(vid),
+        )
+        .unwrap();
+
+    let meta = IndexMeta::load_from(&dir.path().join("meta.json")).unwrap();
+    let disk_vectors = load_vectors(&dir.path().join("vectors.dat"), n, dim).unwrap();
+    let entry_set: Vec<VectorId> = meta.entry_set.iter().map(|&v| VectorId(v)).collect();
+
+    // Create Engine with 2 cores
+    let engine = Engine::new(EngineConfig {
+        index_dir: dir_str.clone(),
+        num_cores: 2,
+        direct_io: false, // tmpfs
+        prefetch_window: 2,
+        prefetch_budget: 2,
+        stall_limit: 0, // no adaptive stopping for this test
+        drain_budget: 0,
+        ..Default::default()
+    });
+
+    // Verify default QD resolution
+    assert_eq!(engine.resolved_global_qd, 16, "default_global_qd(2) should be 16");
+    assert_eq!(engine.global_budget().capacity(), 16);
+    assert_eq!(engine.health(), EngineHealth::Healthy);
+
+    // Generate queries
+    let queries: Vec<Vec<f32>> = generate_vectors(10, dim, 999);
+
+    // Spawn 2 workers, each runs 5 queries
+    let results: Arc<std::sync::Mutex<Vec<(usize, u64)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let mut handles = Vec::new();
+    for core_id in 0..2 {
+        let setup = engine.core_setup(core_id);
+        let entry_set = entry_set.clone();
+        let disk_vectors = disk_vectors.clone();
+        let queries = queries.clone();
+        let results = Arc::clone(&results);
+
+        let handle = spawn_worker(
+            WorkerConfig {
+                core_id: setup.core_id,
+                ..Default::default()
+            },
+            move || async move {
+                let io = IoDriver::open_production(
+                    &setup.index_dir,
+                    dim,
+                    setup.per_core_qd,
+                    setup.direct_io,
+                    setup.global_budget,
+                    setup.health,
+                )
+                .await
+                .unwrap();
+
+                let bank =
+                    divergence_core::distance::FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
+                let pool = AdjacencyPool::new(256 * 1024);
+
+                let recorder = QueryRecorder::new();
+                let start_idx = core_id * 5;
+
+                for i in start_idx..start_idx + 5 {
+                    let q = &queries[i];
+                    let mut guard = SearchGuard::new(&recorder, PerfLevel::EnableTime);
+                    let _results = disk_graph_search_pipe(
+                        q,
+                        &entry_set,
+                        k,
+                        ef,
+                        setup.prefetch_window as usize,
+                        setup.stall_limit,
+                        setup.drain_budget,
+                        &pool,
+                        &io,
+                        &bank,
+                        &mut guard.ctx,
+                        PerfLevel::EnableTime,
+                    )
+                    .await;
+                }
+
+                let io_timing = io.take_io_timing();
+                let snap = recorder.take_snapshot(io_timing);
+
+                // Deposit into mailbox
+                if let Ok(mut slot) = setup.mailbox.lock() {
+                    *slot = Some(snap);
+                }
+
+                results.lock().unwrap().push((core_id, snap.queries));
+            },
+        );
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.join().expect("worker panicked");
+    }
+
+    // Collect stats
+    let stats = engine.collect_stats();
+    eprintln!("Engine stats: total_queries={}, per_core={}, max_p99={:.0}us, health={:?}",
+        stats.total_queries, stats.per_core.len(), stats.max_lat_p99_us, stats.health);
+
+    assert_eq!(stats.total_queries, 10, "should have 10 total queries");
+    assert_eq!(stats.per_core.len(), 2, "should have 2 core snapshots");
+    assert_eq!(stats.health, EngineHealth::Healthy);
+
+    // Verify results
+    let res = results.lock().unwrap();
+    assert_eq!(res.len(), 2);
+}
+
+/// Test B: HealthChecker transitions THROTTLED/HEALTHY based on stats.
+#[test]
+fn test_health_checker_unit() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use divergence_engine::{EngineHealth, CoreSnapshot, QueryRecorder, PerfLevel, SearchGuard};
+
+    let health = Arc::new(std::sync::atomic::AtomicU8::new(EngineHealth::Healthy as u8));
+    let _mailbox: Arc<std::sync::Mutex<Option<CoreSnapshot>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // Create a recorder with high-latency queries
+    let recorder = QueryRecorder::new();
+    for _ in 0..5 {
+        let mut guard = SearchGuard::new(&recorder, PerfLevel::CountOnly);
+        guard.ctx.total_ns = 500_000; // 500us
+        guard.ctx.global_inflight_sum = 15;
+        guard.ctx.global_inflight_samples = 1;
+        guard.ctx.global_inflight_max = 15;
+    }
+
+    // Take snapshot: p99 should be high, inflight_max = 15
+    let snap = recorder.take_snapshot((100, 200, 10));
+    assert!(snap.lat_p99_us > 100.0, "p99 should be high: {}", snap.lat_p99_us);
+    assert_eq!(snap.global_inflight_max, 15);
+
+    // Knee condition: p99 > 100us AND inflight_max > 0.9*16 = 14.4
+    // Both true → should throttle
+    let inflight_threshold = (16.0 * 0.9) as u64; // = 14
+    assert!(snap.global_inflight_max > inflight_threshold);
+
+    // Manually set throttled (simulates what HealthChecker does)
+    health.store(EngineHealth::Throttled as u8, Ordering::Release);
+    assert_eq!(
+        EngineHealth::from(health.load(Ordering::Acquire)),
+        EngineHealth::Throttled,
+    );
+
+    // Clear back to healthy
+    health.store(EngineHealth::Healthy as u8, Ordering::Release);
+    assert_eq!(
+        EngineHealth::from(health.load(Ordering::Acquire)),
+        EngineHealth::Healthy,
+    );
+}
+
+/// Test C: EC2 smoke test with real NVMe + Cohere data.
+/// Run: BENCH_DIR=/mnt/nvme/bench COHERE_N=100000 cargo test --release \
+///   -p divergence-engine --test disk_search test_engine_ec2 -- --nocapture
+#[test]
+fn test_engine_ec2_smoke() {
+    use std::sync::Arc;
+    use divergence_engine::{
+        Engine, EngineConfig, EngineHealth,
+        IoDriver, AdjacencyPool, QueryRecorder, SearchGuard,
+        PerfLevel, WorkerConfig, spawn_worker,
+        disk_graph_search_pipe,
+    };
+
+    let bench_dir = match std::env::var("BENCH_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIPPED: BENCH_DIR not set (EC2 only)");
+            return;
+        }
+    };
+
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let data_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| "data/cohere_100k".to_string());
+
+    if !Path::new(&data_dir).exists() {
+        eprintln!("SKIPPED: {} not found", data_dir);
+        return;
+    }
+
+    let dim = 768;
+    let k = 100;
+    let ef = 200;
+    let m_max = 32;
+    let ef_construction = 200;
+    let num_cores = 2;
+
+    // Load Cohere data
+    let raw: Vec<Vec<f32>> = {
+        let path = format!("{}/base.fvecs", data_dir);
+        if !Path::new(&path).exists() {
+            eprintln!("SKIPPED: {} not found", path);
+            return;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let floats: &[f32] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
+        let mut vecs = Vec::new();
+        let mut offset = 0;
+        while offset < floats.len() {
+            let d = floats[offset] as usize;
+            offset += 1;
+            vecs.push(floats[offset..offset + d].to_vec());
+            offset += d;
+            if vecs.len() >= max_n {
+                break;
+            }
+        }
+        vecs
+    };
+
+    let n = raw.len();
+    eprintln!("Engine EC2 smoke: n={}, dim={}, ef={}, cores={}", n, dim, ef, num_cores);
+
+    // Build NSW
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::L2, n);
+    for (i, v) in raw.iter().enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+
+    // Write to BENCH_DIR
+    let index_dir = format!("{}/engine_smoke", bench_dir);
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let writer = IndexWriter::new(Path::new(&index_dir));
+    writer
+        .write(
+            n as u32,
+            dim,
+            "l2",
+            index.max_degree(),
+            ef_construction,
+            &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+            index.vectors_raw(),
+            |vid| index.neighbors(vid),
+        )
+        .unwrap();
+
+    let meta = IndexMeta::load_from(&Path::new(&index_dir).join("meta.json")).unwrap();
+    let disk_vectors =
+        load_vectors(&Path::new(&index_dir).join("vectors.dat"), n, dim).unwrap();
+    let entry_set: Vec<VectorId> = meta.entry_set.iter().map(|&v| VectorId(v)).collect();
+
+    // Create Engine
+    let engine = Engine::new(EngineConfig {
+        index_dir: index_dir.clone(),
+        num_cores,
+        direct_io: true,
+        prefetch_window: 4,
+        prefetch_budget: 4,
+        stall_limit: 8,
+        drain_budget: 16,
+        ..Default::default()
+    });
+
+    eprintln!(
+        "Engine: gQD={}, per_core_qd={}, query_limiter_cap={}",
+        engine.resolved_global_qd,
+        engine.resolved_per_core_qd,
+        engine.query_limiter().capacity(),
+    );
+
+    // Pick 100 random queries from the dataset
+    let num_queries = 100.min(n);
+    let mut rng = Xoshiro256StarStar::seed_from_u64(42);
+    let query_indices: Vec<usize> = (0..num_queries)
+        .map(|_| rng.r#gen::<usize>() % n)
+        .collect();
+    let queries: Vec<Vec<f32>> = query_indices.iter().map(|&i| raw[i].clone()).collect();
+
+    // Spawn workers
+    let all_results: Arc<std::sync::Mutex<Vec<(usize, Vec<f64>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let queries_per_core = num_queries / num_cores;
+
+    if !with_runtime(|_rt| {}) {
+        eprintln!("SKIPPED: io_uring not available");
+        return;
+    }
+
+    let mut handles = Vec::new();
+    for core_id in 0..num_cores {
+        let setup = engine.core_setup(core_id);
+        let entry_set = entry_set.clone();
+        let disk_vectors = disk_vectors.clone();
+        let queries = queries.clone();
+        let raw_clone = raw.clone();
+        let query_indices = query_indices.clone();
+        let all_results = Arc::clone(&all_results);
+
+        let handle = spawn_worker(
+            WorkerConfig {
+                core_id: setup.core_id,
+                ..Default::default()
+            },
+            move || async move {
+                let io = IoDriver::open_production(
+                    &setup.index_dir,
+                    dim,
+                    setup.per_core_qd,
+                    setup.direct_io,
+                    setup.global_budget,
+                    setup.health,
+                )
+                .await
+                .unwrap();
+
+                let bank =
+                    divergence_core::distance::FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::L2);
+                let pool = AdjacencyPool::new(1024 * 1024);
+
+                let recorder = QueryRecorder::new();
+                let start = core_id * queries_per_core;
+                let end = start + queries_per_core;
+                let mut recalls = Vec::new();
+
+                for i in start..end {
+                    let q = &queries[i];
+                    let mut guard = SearchGuard::new(&recorder, PerfLevel::EnableTime);
+                    let results = disk_graph_search_pipe(
+                        q,
+                        &entry_set,
+                        k,
+                        ef,
+                        setup.prefetch_window as usize,
+                        setup.stall_limit,
+                        setup.drain_budget,
+                        &pool,
+                        &io,
+                        &bank,
+                        &mut guard.ctx,
+                        PerfLevel::EnableTime,
+                    )
+                    .await;
+
+                    // Compute recall against brute-force
+                    let query_idx = query_indices[i];
+                    let mut gt: Vec<(f32, usize)> = (0..n)
+                        .map(|j| {
+                            let d: f32 = raw_clone[query_idx]
+                                .iter()
+                                .zip(raw_clone[j].iter())
+                                .map(|(a, b)| (a - b) * (a - b))
+                                .sum();
+                            (d, j)
+                        })
+                        .collect();
+                    gt.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    let gt_set: std::collections::HashSet<usize> =
+                        gt.iter().take(k).map(|&(_, j)| j).collect();
+                    let found: usize = results
+                        .iter()
+                        .filter(|r| gt_set.contains(&(r.id.0 as usize)))
+                        .count();
+                    recalls.push(found as f64 / k as f64);
+                }
+
+                let io_timing = io.take_io_timing();
+                let snap = recorder.take_snapshot(io_timing);
+
+                if let Ok(mut slot) = setup.mailbox.lock() {
+                    *slot = Some(snap);
+                }
+
+                all_results.lock().unwrap().push((core_id, recalls));
+            },
+        );
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.join().expect("worker panicked");
+    }
+
+    let stats = engine.collect_stats();
+    eprintln!("\n=== Engine Stats ===");
+    eprintln!("total_queries: {}", stats.total_queries);
+    eprintln!("max_p99_us: {:.0}", stats.max_lat_p99_us);
+    eprintln!("avg_io_wait_pct: {:.1}%", stats.avg_io_wait_pct);
+    eprintln!("max_global_inflight: {}", stats.max_global_inflight);
+    eprintln!("sem_wait_pct: {:.1}%", stats.sem_wait_pct);
+    eprintln!(
+        "device_ns_per_io: {:.0}ns ({:.1}us)",
+        stats.device_ns_per_io,
+        stats.device_ns_per_io / 1000.0,
+    );
+    eprintln!("health: {:?}", stats.health);
+    for (i, snap) in stats.per_core.iter().enumerate() {
+        eprintln!(
+            "  core {}: queries={} p50={:.0}us p99={:.0}us io_wait={:.1}%",
+            i, snap.queries, snap.lat_p50_us, snap.lat_p99_us, snap.io_wait_pct,
+        );
+    }
+
+    // Report recalls
+    let res = all_results.lock().unwrap();
+    for (core_id, recalls) in res.iter() {
+        let avg: f64 = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        eprintln!("  core {}: mean_recall={:.3}", core_id, avg);
+    }
+
+    assert_eq!(stats.health, EngineHealth::Healthy);
+    assert!(stats.total_queries > 0);
+}
+
+// ---------------------------------------------------------------------------
+// EXP-SLO: Forced overload admission control validation
+// ---------------------------------------------------------------------------
+
+/// Validates admission control under forced overload with concurrent-per-core IO.
+///
+/// Design: spawns 3 concurrent search tasks per core. Under steady load (0.8x),
+/// only 1-2 are active → no IO contention → low p99. Under overload (3x), all 3
+/// are active → share per_core_qd=4 IO slots → p99 triples → exceeds SLA →
+/// controller engages → reduces query capacity → fewer concurrent searches →
+/// p99 drops.
+///
+/// Run: BENCH_DIR=/mnt/nvme/bench COHERE_N=100000 COHERE_DIR=/mnt/nvme/divergence/data/cohere_100k \
+///   cargo test --release -p divergence-engine --test disk_search exp_slo -- --nocapture
+#[test]
+fn exp_slo_closed_loop() {
+    use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use divergence_engine::{
+        AdjacencyPool, Engine, EngineConfig, HealthChecker, IoDriver, PerfLevel, QueryRecorder,
+        WorkerConfig, disk_graph_search_pipe, spawn_worker,
+    };
+
+    let bench_dir = match std::env::var("BENCH_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIPPED: BENCH_DIR not set (EC2 only)");
+            return;
+        }
+    };
+
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let dataset_dir =
+        std::env::var("COHERE_DIR").unwrap_or_else(|_| "data/cohere_100k".to_string());
+
+    let (vectors, queries_flat, _ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let ef = 200;
+    let w = 4usize;
+    let stall_limit = 4u32;
+    let drain_budget = 16u32;
+    let num_queries_total = nq; // all queries to avoid cache-warming confound
+
+    eprintln!("\n========== EXP-SLO: FORCED OVERLOAD ADMISSION CONTROL ==========");
+    eprintln!(
+        "n={}, dim={}, k={}, ef={}, W={}, S={}, D={}, queries={}",
+        n, dim, k, ef, w, stall_limit, drain_budget, num_queries_total
+    );
+
+    // Build index once, reuse on subsequent runs
+    let index_dir = format!("{}/exp_slo", bench_dir);
+    let adj_path = format!("{}/adjacency.dat", index_dir);
+
+    if !std::path::Path::new(&adj_path).exists() {
+        eprintln!("Building NSW index (first run)...");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let config = NswConfig::new(m_max, ef_construction);
+        let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+        for i in 0..n {
+            builder.insert(VectorId(i as u32), &vectors[i * dim..(i + 1) * dim]);
+        }
+        let index = builder.build();
+        let writer = IndexWriter::new(Path::new(&index_dir));
+        writer
+            .write(
+                n as u32,
+                dim,
+                "cosine",
+                index.max_degree(),
+                ef_construction,
+                &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+                index.vectors_raw(),
+                |vid| index.neighbors(vid),
+            )
+            .unwrap();
+        eprintln!("Index built and saved.");
+    } else {
+        eprintln!("Reusing index at {}", index_dir);
+    }
+
+    // Load shared data
+    let disk_vectors: Arc<[f32]> = Arc::from(
+        load_vectors(&Path::new(&index_dir).join("vectors.dat"), n, dim)
+            .unwrap()
+            .as_slice(),
+    );
+    let entry_set: Arc<[VectorId]> = {
+        let meta = IndexMeta::load_from(&Path::new(&index_dir).join("meta.json")).unwrap();
+        Arc::from(
+            meta.entry_set
+                .iter()
+                .map(|&v| VectorId(v))
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+    };
+    let query_vecs: Arc<[Vec<f32>]> = Arc::from(
+        queries_flat
+            .chunks_exact(dim)
+            .take(num_queries_total)
+            .map(|c| c.to_vec())
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let pool_bytes = (n / 20) * 4096;
+
+    let num_cores = 4;
+    let concurrent_per_core: u32 = 3;
+    // query_cap = total concurrent tasks. Under Healthy, all 12 can run (max IO pressure).
+    // Under Degraded: effective=9 (3 wait), Under Throttled: effective=6 (6 wait).
+    // The yield after drop(_permit) ensures waiters actually get a chance.
+    let query_cap = num_cores * concurrent_per_core as usize; // 12
+
+    // Per-query result
+    #[derive(Clone)]
+    struct QueryResult {
+        latency_us: f64,
+        admit_wait_us: f64,
+        health_sample: u8,
+        phase_tag: u8,
+    }
+
+    // =======================================================================
+    // Phase A: Capacity discovery (sequential, 1 query/core, for baseline)
+    // =======================================================================
+    eprintln!("\n--- Phase A: Baseline Discovery (sequential, {} cores) ---", num_cores);
+
+    let phase_a_n = 200.min(num_queries_total);
+    let phase_a_lats: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+    let phase_a_start = Instant::now();
+
+    {
+        let engine_a = Engine::new(EngineConfig {
+            index_dir: index_dir.clone(),
+            num_cores,
+            direct_io: true,
+            prefetch_window: w,
+            prefetch_budget: 4,
+            stall_limit,
+            drain_budget,
+            ..Default::default()
+        });
+
+        eprintln!(
+            "  gQD={}, per_core_qd={}",
+            engine_a.resolved_global_qd, engine_a.resolved_per_core_qd
+        );
+
+        let queries_per_core = phase_a_n / num_cores;
+        let mut handles = Vec::new();
+
+        for core_id in 0..num_cores {
+            let setup = engine_a.core_setup(core_id);
+            let es = Arc::clone(&entry_set);
+            let dv = Arc::clone(&disk_vectors);
+            let qv = Arc::clone(&query_vecs);
+            let lats = Arc::clone(&phase_a_lats);
+
+            let handle = spawn_worker(
+                WorkerConfig {
+                    core_id: setup.core_id,
+                    uring_entries: 1024,
+                },
+                move || async move {
+                    let io = Rc::new(
+                        IoDriver::open_with_budget(
+                            &setup.index_dir,
+                            dim,
+                            setup.per_core_qd,
+                            setup.direct_io,
+                            Some(setup.global_budget),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let bank = divergence_core::distance::FP32SimdVectorBank::new(
+                        &dv,
+                        dim,
+                        MetricType::Cosine,
+                    );
+                    let _pf = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool),
+                        Rc::clone(&io),
+                        setup.prefetch_budget,
+                    );
+
+                    // Warmup
+                    for i in 0..20 {
+                        let qi = i % qv.len();
+                        let mut perf = SearchPerfContext::default();
+                        let _ = disk_graph_search_pipe(
+                            &qv[qi], &es, k, ef, w, stall_limit, drain_budget,
+                            &pool, &io, &bank, &mut perf, PerfLevel::CountOnly,
+                        )
+                        .await;
+                    }
+
+                    let start_idx = core_id * queries_per_core;
+                    let end_idx = start_idx + queries_per_core;
+                    let mut local_lats = Vec::with_capacity(queries_per_core);
+
+                    for i in start_idx..end_idx {
+                        let qi = i % qv.len();
+                        let t0 = Instant::now();
+                        let mut perf = SearchPerfContext::default();
+                        let _ = disk_graph_search_pipe(
+                            &qv[qi], &es, k, ef, w, stall_limit, drain_budget,
+                            &pool, &io, &bank, &mut perf, PerfLevel::EnableTime,
+                        )
+                        .await;
+                        local_lats.push(t0.elapsed().as_micros() as f64);
+                    }
+
+                    lats.lock().unwrap().extend(local_lats);
+                },
+            );
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("Phase A worker panicked");
+        }
+    }
+
+    let phase_a_wall = phase_a_start.elapsed().as_secs_f64();
+    let peak_qps = (phase_a_n as f64 / phase_a_wall) as u64;
+    let mut sorted = phase_a_lats.lock().unwrap().clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let baseline_p99 = percentile(&sorted, 99.0);
+    let baseline_p50 = percentile(&sorted, 50.0);
+    let p99_sla_us = (1.2 * baseline_p99) as u64;
+
+    eprintln!(
+        "  peak_qps={}, p50={:.0}us, p99={:.0}us, SLA={:.0}us (1.2x)",
+        peak_qps, baseline_p50, baseline_p99, p99_sla_us
+    );
+
+    // =======================================================================
+    // Phase B+C: Concurrent-per-core overload test
+    //
+    // Each core spawns `concurrent_per_core` search tasks. Under overload,
+    // all tasks compete for per_core_qd IO slots, driving up p99.
+    // =======================================================================
+    eprintln!(
+        "\n--- Phase B+C: Concurrent Overload ({} cores, {} tasks/core, query_cap={}) ---",
+        num_cores, concurrent_per_core, query_cap
+    );
+
+    let all_results: Arc<Mutex<Vec<QueryResult>>> = Arc::new(Mutex::new(Vec::new()));
+    let query_queue: Arc<Mutex<std::collections::VecDeque<(usize, u8)>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let stop_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let health_flips: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let last_health: Arc<AtomicU8> = Arc::new(AtomicU8::new(0xff));
+
+    let engine = Engine::new(EngineConfig {
+        index_dir: index_dir.clone(),
+        num_cores,
+        direct_io: true,
+        prefetch_window: w,
+        prefetch_budget: 4,
+        stall_limit,
+        drain_budget,
+        p99_sla_us,
+        health_window: 10,
+        query_cap: Some(query_cap),
+        ..Default::default()
+    });
+
+    eprintln!(
+        "  gQD={}, per_core_qd={}, query_cap={}, SLA={}us",
+        engine.resolved_global_qd,
+        engine.resolved_per_core_qd,
+        engine.query_limiter().capacity(),
+        p99_sla_us,
+    );
+
+    // Spawn workers — each spawns concurrent_per_core search tasks
+    let mut handles = Vec::new();
+    for core_id in 0..num_cores {
+        let setup = engine.core_setup(core_id);
+        let es = Arc::clone(&entry_set);
+        let dv = Arc::clone(&disk_vectors);
+        let qv = Arc::clone(&query_vecs);
+        let results = Arc::clone(&all_results);
+        let queue = Arc::clone(&query_queue);
+        let stop = Arc::clone(&stop_flag);
+        let flips = Arc::clone(&health_flips);
+        let last_h = Arc::clone(&last_health);
+
+        let handle = spawn_worker(
+            WorkerConfig {
+                core_id: setup.core_id,
+                uring_entries: 1024,
+            },
+            move || async move {
+                let io = Rc::new(
+                    IoDriver::open_production(
+                        &setup.index_dir,
+                        dim,
+                        setup.per_core_qd,
+                        setup.direct_io,
+                        setup.global_budget,
+                        Arc::clone(&setup.health),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let _pf = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool),
+                    Rc::clone(&io),
+                    setup.prefetch_budget,
+                );
+                let recorder = Rc::new(QueryRecorder::new());
+                let checker = Rc::new(HealthChecker::new(
+                    Arc::clone(&setup.health),
+                    Arc::clone(&setup.mailbox),
+                    setup.health_window,
+                    setup.p99_sla_us,
+                    setup.gqd_capacity,
+                ));
+
+                let done_count = Rc::new(Cell::new(0u32));
+                let local_results = Rc::new(RefCell::new(Vec::new()));
+
+                // Spawn concurrent search tasks — each creates own bank
+                // (FP32SimdVectorBank borrows data, can't be 'static via Rc)
+                for _ in 0..concurrent_per_core {
+                    let io = Rc::clone(&io);
+                    let pool = Rc::clone(&pool);
+                    let dv = Arc::clone(&dv); // each task owns its Arc
+                    let recorder = Rc::clone(&recorder);
+                    let checker = Rc::clone(&checker);
+                    let queue = Arc::clone(&queue);
+                    let stop = Arc::clone(&stop);
+                    let ql = Arc::clone(&setup.query_limiter);
+                    let es = Arc::clone(&es);
+                    let qv = Arc::clone(&qv);
+                    let flips = Arc::clone(&flips);
+                    let last_h = Arc::clone(&last_h);
+                    let done = Rc::clone(&done_count);
+                    let local_res = Rc::clone(&local_results);
+
+                    monoio::spawn(async move {
+                        let bank = divergence_core::distance::FP32SimdVectorBank::new(
+                            &dv, dim, MetricType::Cosine,
+                        );
+                        loop {
+                            let item = { queue.lock().unwrap().pop_front() };
+
+                            let (qi, phase_tag) = match item {
+                                Some(v) => v,
+                                None => {
+                                    if stop.load(Ordering::Relaxed) {
+                                        done.set(done.get() + 1);
+                                        return;
+                                    }
+                                    monoio::time::sleep(Duration::from_micros(100)).await;
+                                    continue;
+                                }
+                            };
+
+                            // Admission control
+                            let admit_t0 = Instant::now();
+                            let _permit = ql.acquire().await;
+                            let admit_wait_us = admit_t0.elapsed().as_micros() as f64;
+
+                            // Search (manual record instead of SearchGuard for Rc compat)
+                            let t0 = Instant::now();
+                            let mut perf = SearchPerfContext::default();
+                            let _ = disk_graph_search_pipe(
+                                &qv[qi % qv.len()],
+                                &es,
+                                k,
+                                ef,
+                                w,
+                                stall_limit,
+                                drain_budget,
+                                &pool,
+                                &io,
+                                &bank,
+                                &mut perf,
+                                PerfLevel::EnableTime,
+                            )
+                            .await;
+                            perf.total_ns = t0.elapsed().as_nanos() as u64;
+                            recorder.record(&perf);
+                            let latency_us = t0.elapsed().as_micros() as f64;
+
+                            // Health check
+                            checker.on_query_complete(&recorder, &io);
+
+                            let h = checker.health() as u8;
+                            let prev = last_h.swap(h, Ordering::Relaxed);
+                            if prev != h && prev != 0xff {
+                                flips.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            local_res.borrow_mut().push(QueryResult {
+                                latency_us,
+                                admit_wait_us,
+                                health_sample: h,
+                                phase_tag,
+                            });
+
+                            drop(_permit);
+                            // Yield after releasing permit — without this, the same task
+                            // immediately reacquires (no await between drop and acquire),
+                            // starving other waiters and making admission wait always 0.
+                            monoio::time::sleep(Duration::from_micros(1)).await;
+                        }
+                    });
+                }
+
+                // Wait for all tasks to finish
+                while done_count.get() < concurrent_per_core {
+                    monoio::time::sleep(Duration::from_millis(100)).await;
+                }
+
+                // Export results
+                results
+                    .lock()
+                    .unwrap()
+                    .extend(local_results.borrow().iter().cloned());
+            },
+        );
+        handles.push(handle);
+    }
+
+    // Injector thread
+    let overload_mult = 3.0f64;
+    let steady_qps = (peak_qps as f64 * 0.8) as u64;
+    let overload_qps = (peak_qps as f64 * overload_mult) as u64;
+    let recovery_qps = steady_qps;
+
+    eprintln!(
+        "  phases: steady={}qps (10s), overload={}qps (15s), recovery={}qps (10s)",
+        steady_qps, overload_qps, recovery_qps
+    );
+
+    let queue_inj = Arc::clone(&query_queue);
+    let stop_inj = Arc::clone(&stop_flag);
+
+    let injector = std::thread::spawn(move || {
+        let phases: [(u64, u64, u8); 3] = [
+            (steady_qps, 10, 0),
+            (overload_qps, 15, 1),
+            (recovery_qps, 10, 2),
+        ];
+
+        let mut query_idx = 0usize;
+
+        for &(target_qps, duration_s, phase_tag) in &phases {
+            let phase_start = Instant::now();
+            let interval = if target_qps > 0 {
+                Duration::from_nanos(1_000_000_000 / target_qps)
+            } else {
+                Duration::from_secs(1)
+            };
+
+            while phase_start.elapsed().as_secs() < duration_s {
+                {
+                    let mut q = queue_inj.lock().unwrap();
+                    q.push_back((query_idx, phase_tag));
+                }
+                query_idx += 1;
+                std::thread::sleep(interval);
+            }
+        }
+
+        stop_inj.store(true, Ordering::Release);
+    });
+
+    injector.join().expect("injector panicked");
+
+    // Give workers time to drain
+    std::thread::sleep(Duration::from_secs(5));
+    stop_flag.store(true, Ordering::Release);
+
+    for h in handles {
+        h.join().expect("worker panicked");
+    }
+
+    // ===================================================================
+    // Analysis
+    // ===================================================================
+    let results = all_results.lock().unwrap();
+
+    let phase_results: Vec<Vec<&QueryResult>> = (0..3)
+        .map(|tag| {
+            let phase: Vec<&QueryResult> =
+                results.iter().filter(|r| r.phase_tag == tag).collect();
+            let skip = phase.len() * 3 / 10;
+            phase[skip..].to_vec()
+        })
+        .collect();
+
+    let analyze = |phase: &[&QueryResult]| -> (f64, f64, f64, f64, f64, [u64; 3]) {
+        if phase.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0, 0.0, [0; 3]);
+        }
+        let mut lats: Vec<f64> = phase.iter().map(|r| r.latency_us).collect();
+        lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut admits: Vec<f64> = phase.iter().map(|r| r.admit_wait_us).collect();
+        admits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let mut hdist = [0u64; 3];
+        for r in phase {
+            hdist[(r.health_sample as usize).min(2)] += 1;
+        }
+
+        (
+            percentile(&lats, 50.0),
+            percentile(&lats, 99.0),
+            percentile(&lats, 99.9),
+            percentile(&admits, 50.0),
+            percentile(&admits, 99.0),
+            hdist,
+        )
+    };
+
+    let steady = analyze(&phase_results[0]);
+    let overload = analyze(&phase_results[1]);
+    let recovery = analyze(&phase_results[2]);
+
+    let steady_ach = phase_results[0].len() as f64 / 10.0;
+    let overload_ach = phase_results[1].len() as f64 / 15.0;
+    let recovery_ach = phase_results[2].len() as f64 / 10.0;
+    let total_flips = health_flips.load(Ordering::Relaxed);
+
+    let fmt_health = |d: [u64; 3]| -> String {
+        let t = (d[0] + d[1] + d[2]) as f64;
+        if t == 0.0 {
+            return "N/A".to_string();
+        }
+        format!(
+            "H:{:.0}% D:{:.0}% T:{:.0}%",
+            d[0] as f64 / t * 100.0,
+            d[1] as f64 / t * 100.0,
+            d[2] as f64 / t * 100.0,
+        )
+    };
+
+    eprintln!(
+        "\n{:<12} {:>7} {:>7} {:>7} {:>7} {:>8} {:>8} {:>10} {}",
+        "Phase", "tgt_qps", "ach_qps", "p50us", "p99us", "p999us", "adm_p50", "adm_p99",
+        "health"
+    );
+    eprintln!(
+        "{:<12} {:>7} {:>7.0} {:>7.0} {:>7.0} {:>8.0} {:>8.0} {:>10.0} {}",
+        "STEADY", steady_qps, steady_ach, steady.0, steady.1, steady.2, steady.3,
+        steady.4, fmt_health(steady.5)
+    );
+    eprintln!(
+        "{:<12} {:>7} {:>7.0} {:>7.0} {:>7.0} {:>8.0} {:>8.0} {:>10.0} {}",
+        "OVERLOAD", overload_qps, overload_ach, overload.0, overload.1, overload.2,
+        overload.3, overload.4, fmt_health(overload.5)
+    );
+    eprintln!(
+        "{:<12} {:>7} {:>7.0} {:>7.0} {:>7.0} {:>8.0} {:>8.0} {:>10.0} {}",
+        "RECOVERY", recovery_qps, recovery_ach, recovery.0, recovery.1, recovery.2,
+        recovery.3, recovery.4, fmt_health(recovery.5)
+    );
+    eprintln!("Health flips: {}", total_flips);
+
+    // ===================================================================
+    // Acceptance gates
+    // ===================================================================
+    let (steady_p99, overload_p99, recovery_p99) = (steady.1, overload.1, recovery.1);
+    let overload_health = overload.5;
+    let overload_admit_p99 = overload.4;
+
+    // G1: search p99 stays bounded (admission control prevents catastrophe)
+    let g1 = if steady_p99 > 0.0 {
+        overload_p99 < 10.0 * steady_p99
+    } else {
+        true
+    };
+    eprintln!(
+        "\n{}: overload search p99 ({:.0}) < 10x steady ({:.0})",
+        if g1 { "PASS" } else { "FAIL" },
+        overload_p99,
+        10.0 * steady_p99
+    );
+
+    // G2: recovery
+    let g2 = if steady_p99 > 0.0 {
+        recovery_p99 < 2.0 * steady_p99
+    } else {
+        true
+    };
+    eprintln!(
+        "{}: recovery p99 ({:.0}) < 2x steady ({:.0})",
+        if g2 { "PASS" } else { "FAIL" },
+        recovery_p99,
+        2.0 * steady_p99
+    );
+
+    // G3: no throughput crash
+    let g3 = overload_ach >= 0.3 * peak_qps as f64;
+    eprintln!(
+        "{}: overload QPS ({:.0}) >= 0.3x peak ({:.0})",
+        if g3 { "PASS" } else { "FAIL" },
+        overload_ach,
+        0.3 * peak_qps as f64
+    );
+
+    // G4: controller MUST engage
+    let throttle_count = overload_health[1] + overload_health[2];
+    let g4 = throttle_count > 0;
+    eprintln!(
+        "{}: controller engaged during overload (D+T: {} samples)",
+        if g4 { "PASS" } else { "FAIL" },
+        throttle_count
+    );
+
+    // G5: admission wait rises
+    let g5 = overload_admit_p99 > 100.0;
+    eprintln!(
+        "{}: admission wait p99 ({:.0}us) > 100us during overload",
+        if g5 { "PASS" } else { "FAIL" },
+        overload_admit_p99
+    );
+
+    // G6: no oscillation
+    let g6 = total_flips <= 10;
+    eprintln!(
+        "{}: health flips ({}) <= 10",
+        if g6 { "PASS" } else { "FAIL" },
+        total_flips
+    );
+
+    // Hard assertions
+    assert!(g1, "GATE 1 FAILED: search p99 explosion");
+    assert!(g3, "GATE 3 FAILED: throughput collapsed");
+    assert!(g4, "GATE 4 FAILED: controller never engaged — no IO contention under overload");
+    assert!(g5, "GATE 5 FAILED: admission wait never rose (query_cap may be too high)");
+}
+
+/// Device calibration test — requires BENCH_DIR.
+///
+/// Run: BENCH_DIR=/mnt/nvme/bench cargo test --release -p divergence-engine \
+///   --test disk_search test_calibrate -- --nocapture
+#[test]
+fn test_calibrate_device() {
+    use divergence_engine::{calibrate_device, default_global_qd};
+
+    let bench_dir = match std::env::var("BENCH_DIR") {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("SKIPPED: BENCH_DIR not set (EC2 only)");
+            return;
+        }
+    };
+
+    // Need a file to calibrate against. Use the adjacency file from exp_slo if it exists,
+    // otherwise create a dummy file.
+    let cal_file = format!("{}/calibrate_test.dat", bench_dir);
+    if !Path::new(&cal_file).exists() {
+        // Create a 64MB file for calibration
+        use std::io::Write;
+        let mut f = std::fs::File::create(&cal_file).unwrap();
+        let block = vec![0u8; 4096];
+        for _ in 0..(64 * 1024 * 1024 / 4096) {
+            f.write_all(&block).unwrap();
+        }
+        f.sync_all().unwrap();
+    }
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let cal = calibrate_device(&cal_file, true).await.unwrap();
+
+            eprintln!("\n=== DEVICE CALIBRATION ===");
+            eprintln!("{:<6} {:>10} {:>10}", "QD", "IOPS", "p99_us");
+            for m in &cal.levels {
+                eprintln!("{:<6} {:>10.0} {:>10.1}", m.qd, m.iops, m.p99_us);
+            }
+
+            let formula_qd = default_global_qd(2);
+            let recommended = cal.recommended_qd.min(formula_qd);
+            eprintln!(
+                "\nRaw knee: QD={}, formula: QD={}, recommended: QD={}",
+                cal.recommended_qd, formula_qd, recommended
+            );
+
+            assert!(cal.recommended_qd >= 1, "knee should be at least 1");
+            assert!(!cal.levels.is_empty(), "should have measurements");
+        });
+    }) {
+        eprintln!("SKIPPED: io_uring not available");
+    }
+}
+

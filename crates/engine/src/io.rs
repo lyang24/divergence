@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
@@ -228,6 +228,9 @@ pub struct IoDriver {
     dimension: usize,
     /// Cross-core global IO budget. None = single-core / test mode.
     global_budget: Option<Arc<GlobalIoBudget>>,
+    /// Health flag shared with HealthChecker. None = test mode.
+    #[allow(dead_code)]
+    health: Option<Arc<AtomicU8>>,
     /// Cumulative nanoseconds spent waiting for global + local permits.
     sem_wait_ns: Cell<u64>,
     /// Cumulative nanoseconds spent in actual NVMe reads (device time).
@@ -274,6 +277,42 @@ impl IoDriver {
             adj_capacity: adj_inflight,
             dimension,
             global_budget,
+            health: None,
+            sem_wait_ns: Cell::new(0),
+            device_ns: Cell::new(0),
+            io_count: Cell::new(0),
+        })
+    }
+
+    /// Production mode. Global budget required, health flag required.
+    ///
+    /// The health flag is stored for potential future use by the IO path
+    /// (e.g., adaptive backoff). Currently only read by HealthChecker.
+    pub async fn open_production(
+        index_dir: &str,
+        dimension: usize,
+        adj_inflight: usize,
+        direct_io: bool,
+        global_budget: Arc<GlobalIoBudget>,
+        health: Arc<AtomicU8>,
+    ) -> io::Result<Self> {
+        let adj_path = format!("{}/adjacency.dat", index_dir);
+
+        let mut opts = monoio::fs::OpenOptions::new();
+        opts.read(true);
+        if direct_io {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+
+        let adj_file = opts.open(&adj_path).await?;
+
+        Ok(Self {
+            adj_file,
+            adj_sem: LocalSemaphore::new(adj_inflight),
+            adj_capacity: adj_inflight,
+            dimension,
+            global_budget: Some(global_budget),
+            health: Some(health),
             sem_wait_ns: Cell::new(0),
             device_ns: Cell::new(0),
             io_count: Cell::new(0),

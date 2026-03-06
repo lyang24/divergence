@@ -456,6 +456,30 @@ impl QueryRecorder {
         }
     }
 
+    /// Take a lightweight snapshot of current stats and reset for fresh window.
+    ///
+    /// `io_timing` is from `IoDriver::take_io_timing()`: (sem_wait_ns, device_ns, io_count).
+    pub fn take_snapshot(&self, io_timing: (u64, u64, u64)) -> CoreSnapshot {
+        let snap = CoreSnapshot {
+            queries: self.query_count.get(),
+            lat_p50_us: self.p50_total_us(),
+            lat_p99_us: self.p99_total_us(),
+            lat_p999_us: self.p999_total_us(),
+            io_wait_pct: self.io_wait_pct(),
+            global_inflight_avg: self.global_inflight_mean(),
+            global_inflight_max: self.global_inflight_max(),
+            sem_wait_ns: io_timing.0,
+            device_ns: io_timing.1,
+            io_count: io_timing.2,
+            admit_wait_ns: 0,
+            admit_count: 0,
+            admit_total: 0,
+            health_at_snapshot: 0,
+        };
+        self.reset();
+        snap
+    }
+
     /// Reset all histograms (for window boundary).
     pub fn reset(&self) {
         self.total_ns.borrow_mut().reset();
@@ -467,6 +491,60 @@ impl QueryRecorder {
         self.inflight_local.borrow_mut().reset();
         self.inflight_global.borrow_mut().reset();
         self.query_count.set(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CoreSnapshot — lightweight per-core stats snapshot
+// ---------------------------------------------------------------------------
+
+/// Lightweight per-core stats snapshot. Send-safe, no histograms.
+/// Produced by `QueryRecorder::take_snapshot()`, consumed by Engine for aggregation.
+#[derive(Debug, Clone, Copy)]
+pub struct CoreSnapshot {
+    pub queries: u64,
+    pub lat_p50_us: f64,
+    pub lat_p99_us: f64,
+    pub lat_p999_us: f64,
+    /// io_wait_ns / total_ns as percentage (0–100).
+    pub io_wait_pct: f64,
+    pub global_inflight_avg: f64,
+    pub global_inflight_max: u64,
+    pub sem_wait_ns: u64,
+    pub device_ns: u64,
+    pub io_count: u64,
+    /// Cumulative admission wait time in nanoseconds.
+    pub admit_wait_ns: u64,
+    /// Queries that had non-zero admission wait.
+    pub admit_count: u64,
+    /// Total queries attempted (including those with zero wait).
+    pub admit_total: u64,
+    /// EngineHealth value when this snapshot was taken.
+    pub health_at_snapshot: u8,
+}
+
+// Safety: CoreSnapshot is all Copy scalars, inherently Send+Sync.
+unsafe impl Send for CoreSnapshot {}
+unsafe impl Sync for CoreSnapshot {}
+
+impl Default for CoreSnapshot {
+    fn default() -> Self {
+        Self {
+            queries: 0,
+            lat_p50_us: 0.0,
+            lat_p99_us: 0.0,
+            lat_p999_us: 0.0,
+            io_wait_pct: 0.0,
+            global_inflight_avg: 0.0,
+            global_inflight_max: 0,
+            sem_wait_ns: 0,
+            device_ns: 0,
+            io_count: 0,
+            admit_wait_ns: 0,
+            admit_count: 0,
+            admit_total: 0,
+            health_at_snapshot: 0,
+        }
     }
 }
 

@@ -168,3 +168,52 @@ add_epi32 ×2         accumulate
    guaranteed. On Haswell+, unaligned loads from aligned addresses have no penalty.
    Explicitly aligning i8 storage to 32B is an option but adds padding waste (up to
    31 bytes per vector).
+
+---
+
+## AD-6: Two-level IO budgeting with GlobalIoBudget (2026-03-04)
+
+**Problem**: Multi-core search shares one NVMe device. Without a global queue depth
+cap, cores over-subscribe the device, causing tail latency explosion.
+
+**Evidence** (EXP-QD, Cohere 100K, 768d, k=100, ef=200, W=4, i4i.2xlarge NVMe):
+
+fio baseline (4KB random reads):
+- QD=8-16: 211K IOPS, p99<100μs (sweet spot)
+- QD=32: cliff — IOPS flat but p99 spikes
+
+Multi-core sweep (gQD = global budget, lQD = gQD/cores):
+```
+cores  gQD    lQD     qps    p50us    p99us   sem_w%  dev_w%
+1      8      8       109     8013    10804     0.0   100.0
+2      12     6       180     8375    11048     0.0   100.0
+4      16     4       254     9525    14426     4.3    95.7
+4      24     6       269     8865    11975     0.0   100.0
+8      24     3       265    14020    20057    28.2    71.8
+8      32     4       321    10849    14552     2.2    97.8
+```
+
+Under-provisioned gQD is catastrophic (8 cores, gQD=4 → p50=85ms, sem_w%=93%).
+Over-provisioned gQD is harmless (p50/p99 flat beyond the knee).
+
+**Decision**: Two-level IO budget:
+1. **GlobalIoBudget** (atomic CAS, `Arc`, cross-core) — caps total device queue depth
+2. **LocalSemaphore** (per-core, `RefCell`) — caps per-core burst
+
+Every IO acquires global token first, then local permit. Both are RAII.
+
+**Default**: `gQD = max(16, 4 × cores)`. This keeps sem_w% ≈ 0 at all core counts.
+For i4i.2xlarge (8 vCPU): gQD=32 → 321 QPS, p50=10.8ms, p99=14.6ms.
+
+**Scaling characteristics** (gQD at sweet spot):
+- 1→2 cores: 1.65x QPS
+- 1→4 cores: 2.47x QPS
+- 1→8 cores: 2.95x QPS
+- Sub-linear because search is serial (201 IOs/query) — device IOPS is not the bottleneck.
+
+**Implementation**: `GlobalIoBudget` in `crates/engine/src/io.rs`.
+- `try_acquire()`: atomic CAS loop, returns bool
+- `release()`: atomic fetch_add
+- `acquire_global()`: async loop with 5μs yield on failure (lets CQEs complete)
+- `IoDriver::open_with_budget(... Option<Arc<GlobalIoBudget>>)`: two-level mode
+- `IoDriver::open(...)`: backward-compatible, local-only mode (None budget)
