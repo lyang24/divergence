@@ -1,3 +1,4 @@
+pub mod ada_ef;
 pub mod aligned;
 pub mod cache;
 pub mod calibrate;
@@ -7,6 +8,7 @@ pub mod perf;
 pub mod runtime;
 pub mod search;
 
+pub use ada_ef::{AdaEfParams, AdaEfStats, AdaEfTable, estimate_ada_ef};
 pub use aligned::AlignedBuf;
 pub use cache::{AdjacencyPool, CacheGuard, CacheStatsSnapshot};
 pub use calibrate::{calibrate_device, CalibrationResult, QdMeasurement};
@@ -20,4 +22,7 @@ pub use perf::{
     SearchPerfContext,
 };
 pub use runtime::{spawn_worker, WorkerConfig};
-pub use search::{disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_refine};
+pub use search::{
+    disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
+    disk_graph_search_pq, disk_graph_search_refine,
+};

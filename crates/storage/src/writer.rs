@@ -1,15 +1,18 @@
 //! IndexWriter — serializes an in-memory graph to disk files.
 //!
-//! Produces three files in the output directory:
-//!   - adjacency.dat: one 4096-byte block per vector
+//! Produces three or four files in the output directory:
+//!   - adjacency.dat: one 4096-byte block per vector (v1 or v2)
 //!   - vectors.dat: contiguous f32 array
 //!   - meta.json: index metadata + entry set
+//!   - pq_codebook.bin: PQ codebook (only for v2 / inline PQ)
 
 use std::io;
 use std::path::PathBuf;
 
+use divergence_core::quantization::pq::PqCodebook;
+
 use crate::adjacency::{self, BLOCK_SIZE};
-use crate::meta::IndexMeta;
+use crate::meta::{IndexMeta, PqMeta};
 use crate::vectors;
 
 pub struct IndexWriter {
@@ -21,7 +24,7 @@ impl IndexWriter {
         Self { dir: dir.into() }
     }
 
-    /// Write all index files. Takes raw data — no dependency on index crate.
+    /// Write v1 index files (no inline PQ codes). Legacy interface.
     pub fn write<'a>(
         &self,
         num_vectors: u32,
@@ -35,17 +38,14 @@ impl IndexWriter {
     ) -> io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
 
-        // Write adjacency.dat
         adjacency::write_adjacency_file(
             &self.adj_path(),
             num_vectors,
             &neighbors_fn,
         )?;
 
-        // Write vectors.dat
         vectors::write_vectors_file(&self.vec_path(), vectors_data)?;
 
-        // Write meta.json
         let meta = IndexMeta {
             dimension,
             metric: metric.to_string(),
@@ -54,6 +54,119 @@ impl IndexWriter {
             ef_construction,
             adj_block_size: BLOCK_SIZE,
             entry_set: entry_set.iter().map(|&v| v).collect(),
+            adj_layout_version: 1,
+            pq: None,
+            num_pages: None,
+        };
+        meta.write_to(&self.meta_path())?;
+
+        Ok(())
+    }
+
+    /// Write v2 index files with inline PQ codes in adjacency blocks.
+    ///
+    /// `codebook`: trained PQ codebook.
+    /// `pq_codes_all`: flat encoded PQ codes, shape (num_vectors, codebook.m).
+    ///   Must be pre-computed via `codebook.encode_all()`.
+    /// `pq_metric`: metric used for PQ training ("l2" or "ip").
+    pub fn write_v2<'a>(
+        &self,
+        num_vectors: u32,
+        dimension: usize,
+        metric: &str,
+        max_degree: usize,
+        ef_construction: usize,
+        entry_set: &[u32],
+        vectors_data: &[f32],
+        neighbors_fn: impl Fn(u32) -> &'a [u32],
+        codebook: &PqCodebook,
+        pq_codes_all: &[u8],
+        pq_metric: &str,
+    ) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+
+        // Write v2 adjacency blocks with inline PQ codes
+        adjacency::write_adjacency_file_v2(
+            &self.adj_path(),
+            num_vectors,
+            &neighbors_fn,
+            pq_codes_all,
+            codebook.m,
+        )?;
+
+        vectors::write_vectors_file(&self.vec_path(), vectors_data)?;
+
+        // Write PQ codebook
+        let codebook_filename = "pq_codebook.bin";
+        codebook.save(&self.dir.join(codebook_filename))?;
+
+        let meta = IndexMeta {
+            dimension,
+            metric: metric.to_string(),
+            num_vectors,
+            max_degree,
+            ef_construction,
+            adj_block_size: BLOCK_SIZE,
+            entry_set: entry_set.iter().map(|&v| v).collect(),
+            adj_layout_version: 2,
+            pq: Some(PqMeta {
+                num_subquantizers: codebook.m,
+                num_centroids: codebook.k,
+                subspace_dim: codebook.subspace_dim,
+                metric: pq_metric.to_string(),
+                codebook_file: codebook_filename.to_string(),
+            }),
+            num_pages: None,
+        };
+        meta.write_to(&self.meta_path())?;
+
+        Ok(())
+    }
+
+    /// Write v3 index files with page-packed adjacency + BFS reorder.
+    ///
+    /// Produces:
+    ///   - adjacency_pages.dat: packed 4KB pages
+    ///   - adj_index.dat: vid → (page_id, offset, degree), DRAM-resident
+    ///   - vectors.dat: contiguous f32 array
+    ///   - meta.json: index metadata (adj_layout_version=3)
+    ///
+    /// `reorder`: old_to_new VID mapping (from `bfs_reorder_graph`).
+    pub fn write_v3<'a>(
+        &self,
+        num_vectors: u32,
+        dimension: usize,
+        metric: &str,
+        max_degree: usize,
+        ef_construction: usize,
+        entry_set: &[u32],
+        vectors_data: &[f32],
+        neighbors_fn: impl Fn(u32) -> &'a [u32],
+        reorder: &[u32],
+    ) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+
+        let num_pages = adjacency::write_packed_adjacency(
+            &self.pages_path(),
+            &self.adj_index_path(),
+            num_vectors,
+            &neighbors_fn,
+            reorder,
+        )?;
+
+        vectors::write_vectors_file(&self.vec_path(), vectors_data)?;
+
+        let meta = IndexMeta {
+            dimension,
+            metric: metric.to_string(),
+            num_vectors,
+            max_degree,
+            ef_construction,
+            adj_block_size: BLOCK_SIZE,
+            entry_set: entry_set.iter().map(|&v| v).collect(),
+            adj_layout_version: 3,
+            pq: None,
+            num_pages: Some(num_pages),
         };
         meta.write_to(&self.meta_path())?;
 
@@ -70,6 +183,18 @@ impl IndexWriter {
 
     pub fn meta_path(&self) -> PathBuf {
         self.dir.join("meta.json")
+    }
+
+    pub fn codebook_path(&self) -> PathBuf {
+        self.dir.join("pq_codebook.bin")
+    }
+
+    pub fn pages_path(&self) -> PathBuf {
+        self.dir.join("adjacency_pages.dat")
+    }
+
+    pub fn adj_index_path(&self) -> PathBuf {
+        self.dir.join("adj_index.dat")
     }
 }
 

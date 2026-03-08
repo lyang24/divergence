@@ -1,0 +1,30 @@
+=== EXP-PAGE-TRACE v2: Cohere 100K, dim=768, k=100, ef=200 ===
+Byte-accurate page packing simulation (page_size=4096B)
+Page layout: header(4B) + directory(8B/entry) + records(degree*4B/entry)
+recall=0.963, avg_expansions=201.1
+
+Degree distribution: min=1 p25=8 p50=14 mean=15.1 p75=22 max=32
+Avg record: 68B, max record: 136B
+
+reorder	pages	n/pg	min	p50	max	util%	pg/q	p50_pg	p99_pg	ratio
+sequential	1688	59.2	38	57	97	99.0	189.8	190	196	0.944
+bfs	1688	59.2	30	54	324	99.0	135.1	135	164	0.672
+
+Neighbor co-expansion: 87079/497817 (17.5%)
+
+Working set (100 queries):
+  sequential: 1687/1688 touched (99.9%)
+  bfs: 1656/1688 touched (98.1%)
+
+Page access frequency (BFS reorder):
+  total accesses: 20112 across 1656 unique pages
+  top-1: 123 (0.6%)
+  top-5: 476 (2.4%)
+  top-10: 843 (4.2%)
+  top-20: 1451 (7.2%)
+  top-50: 2819 (14.0%)
+  top-100: 4560 (22.7%)
+  hottest page: 1.2 accesses/query
+  intra-query reuse: 36.0 pages/q reused >1 time (100% of queries)
+
+adj_index overhead: 100K × 8B = 0.8 MB (DRAM)

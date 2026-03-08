@@ -1,0 +1,15 @@
+# BENCH: Cohere 100K, dim=768, GT=brute-force, seed=42, nq=100, warmup=10
+# Instance: i4i (54.177.159.179), NVMe direct_io=true, BENCH_DIR=/mnt/nvme/bench
+# Date: 2026-03-07 (Ada-ef v0, recalibrated thresholds)
+# Index: NSW m_max=32, ef_c=200, cosine, entry_set=64
+# Ada-ef: diagonal-only variance, score thresholds=[18,14,11,7] → ef=[120,150,170,190], floor=200
+# Score distribution: min=4.96 p25=11.09 p50=13.83 mean=14.50 p75=18.51 max=28.24
+# cold: cache_pct=0 (single 8-way set, 32KB), warmup=0
+# warm: cache_pct=5, warmup=10
+label	ef	k	W	S	D	c%	recall	p50ms	p99ms	qps	exp	use	wst	blk/q	mis/q	hit/q	sf/q	pf_i	pf_c	best@	1stk@	early%	waste%	hit%	io_ms	cmp_ms	dst_ms	ms/mis
+warm	200	100	4	0	0	5	0.963	8.0	10.5	130.8	201	92	109	201.1	24.3	176.8	45.0	127.5	122.6	13.3	1.3	0.0	54.1	87.9	5.63	1.85	1.63	0.232
+warm-S4D16	200	100	4	4	16	5	0.960	7.7	10.5	141.0	184	91	93	183.8	23.6	160.2	39.2	115.7	110.7	11.7	1.3	52.0	50.6	87.2	5.23	1.71	1.50	0.222
+warm-ada	200	100	4	0	0	5	0.946	6.0	9.8	168.8	149	75	74	148.9	20.9	128.0	30.1	93.3	88.5	10.4	1.3	46.0	49.5	86.0	4.38	1.40	1.23	0.209
+cold	200	100	4	0	0	0	0.963	14.1	16.8	71.6	201	92	109	201.1	84.5	117.1	38.7	237.4	117.1	13.3	1.3	0.0	54.1	58.2	11.95	1.86	1.63	0.141
+cold-S4D16	200	100	4	4	16	0	0.960	13.4	16.9	76.4	184	91	93	183.8	78.8	105.5	34.0	220.0	105.5	11.7	1.3	52.0	50.6	57.4	11.11	1.81	1.60	0.141
+cold-ada	200	100	4	0	0	0	0.946	10.9	16.0	92.1	149	75	74	148.9	66.3	83.2	27.0	181.2	83.2	10.4	1.3	46.0	49.5	55.8	9.19	1.52	1.35	0.138

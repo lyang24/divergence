@@ -1,0 +1,64 @@
+=== EXP-BENCH v3 (v2): Page-Packed Adjacency with Physical IO Counting ===
+Cohere 100K, dim=768, k=100, ef=200, W=4, nq=100, warmup=10
+v3: 1537 pages, adj_index=781KB DRAM
+
+NEW: phy/q = physical NVMe reads (miss loads + prefetch loads + bypasses)
+NEW: v3-perq-cold = pool.clear() before each query (true single-query cold)
+
+--- v1 baseline ---
+label            ef    k  W   S   D   c%  recall   p50ms   p99ms     qps   exp  blk/q  mis/q  phy/q  hit/q   hit%
+warm            200  100  4   0   0    5   0.963     8.4    10.7   124.8   201  201.1   24.3  151.8  176.8  87.9
+warm-S4D16      200  100  4   4  16    5   0.960     8.0    10.9   134.4   184  183.8   23.6  139.3  160.2  87.2
+cold            200  100  4   0   0    0   0.963    14.5    17.6    69.0   201  201.1   84.0  322.1  117.6  58.5
+cold-S4D16      200  100  4   4  16    0   0.960    14.1    17.0    73.9   184  183.8   79.9  297.3  104.5  56.8
+
+--- v3 page-packed adjacency (BFS reorder) ---
+label            ef    k  W   S   D   c%  recall   p50ms   p99ms     qps   exp  blk/q  mis/q  phy/q  hit/q   hit%
+v3-warm         200  100  4   0   0    5   0.963     7.4    10.1   133.9   201  201.1   18.9  114.3  182.2  90.6
+v3-warm-S4D16   200  100  4   4  16    5   0.960     7.2     9.7   143.2   184  183.8   18.7  105.6  165.1  89.8
+v3-cold         200  100  4   0   0    0   0.963     7.4     9.7   133.4   201  201.1   19.0  114.4  182.1  90.5
+v3-perq-cold    200  100  4   0   0    0   0.963     8.6    11.8   114.0   201  201.1   23.5  135.8  177.7  88.3
+v3-perq-S4D16   200  100  4   4  16    0   0.960     9.0    12.0   112.2   184  183.8   22.9  127.3  160.9  87.5
+
+=== Analysis ===
+
+1. Physical IO (phy/q) — the real NVMe workload:
+   v1-warm:      151.8 phy/q  (24.3 await-misses + ~128 prefetch loads)
+   v3-warm:      114.3 phy/q  (18.9 await-misses + ~95 prefetch loads)
+   v3-perq-cold: 135.8 phy/q  (23.5 await-misses + ~112 prefetch loads)
+
+   v1→v3 warm:   151.8 → 114.3 = -25% physical IO reduction
+   v1→v3 perq:   151.8 → 135.8 = -11% (pure intra-query reuse, no cross-query warming)
+
+2. v3-perq-cold validates simulation:
+   Simulation predicted ~135 unique pages/q with BFS reorder.
+   Measured: 135.8 phy/q — matches simulation within 1%.
+   This confirms: BFS page packing alone gives ~11% IO reduction from intra-query reuse.
+
+3. Cross-query warming is the bigger win:
+   v3-cold phy/q = 114.4 (steady-state, no warmup, cross-query cache warms)
+   v3-perq-cold phy/q = 135.8 (per-query cold)
+   Delta: 21.4 reads/q saved by cross-query hot pages (hub region cached)
+
+   Total v3-cold savings: 151.8 → 114.4 = -25% = intra-query (11%) + cross-query (14%)
+
+4. v1-cold has INFLATED phy/q:
+   v1-cold: 322.1 phy/q (!!) — much higher than 201 expansions
+   This means 322-201 = 121 EXTRA prefetch reads that never became hits
+   (tiny 32KB pool evicts pages before they can be reused)
+   v3-cold pool (1MB) retains prefetched pages → prefetch is effective.
+
+5. Latency impact:
+   Config         p50ms  p99ms   qps
+   v1-warm         8.4   10.7   124.8
+   v3-warm         7.4   10.1   133.9   (-12% p50, +7% qps)
+   v3-perq-cold    8.6   11.8   114.0   (+2% p50 vs v1-warm — intra-query alone is ~break-even)
+   v3-cold         7.4    9.7   133.4   (-12% p50 vs v1-warm, with NO warmup)
+
+6. Key insight: v3's win comes from TWO sources:
+   a) Intra-query page reuse (BFS packing, ~11% phy/q reduction)
+   b) Cross-query hot-page persistence (hub pages stay cached, ~14% more)
+   c) Effective prefetch (v3 pool large enough to keep prefetched pages)
+   The combined effect: v3-cold with zero warmup outperforms v1-warm (5% warmup).
+
+7. Recall unchanged: 0.963 for all configs (same graph, same algorithm).

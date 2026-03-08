@@ -239,6 +239,7 @@ dependencies = [
  "half",
  "rand",
  "rand_xoshiro",
+ "tempfile",
  "thiserror",
 ]
 

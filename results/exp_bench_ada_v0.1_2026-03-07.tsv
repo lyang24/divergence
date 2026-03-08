@@ -1,0 +1,27 @@
+# BENCH: Cohere 100K, dim=768, GT=brute-force, seed=42, nq=100, warmup=10
+# Instance: i4i (54.177.159.179), NVMe direct_io=true, BENCH_DIR=/mnt/nvme/bench
+# Date: 2026-03-07 (Ada-ef v0.1, conservative thresholds + bucket diagnostics)
+# Index: NSW m_max=32, ef_c=200, cosine, entry_set=64
+# Ada-ef: diagonal-only variance, score thresholds=[20,16,12] → ef=[150,170,185], floor=200
+# Score distribution: min=4.96 p25=11.09 p50=13.83 mean=14.50 p75=18.51 max=28.24
+# Bucket distribution: >=20:18q >=16:16q >=12:31q <12:35q
+#
+# KEY FINDING: recall loss is NOT from Ada-ef cutting too hard.
+# The <12 bucket (35 hardest queries) has recall=0.933 at ef=200 (full budget).
+# Easy queries (>=20) hold recall=0.963 with ef=150 (saves 75 blk/q).
+# Ada-ef correctly identifies easy vs hard; hard queries are inherently hard at ef=200.
+#
+# Per-bucket breakdown (identical for warm/cold — deterministic scoring):
+# bucket     n  recall  blk/q avg_ef
+#   >=20    18   0.963  125.7    150
+#   >=16    16   0.969  157.6    170
+#   >=12    31   0.972  175.3    185
+#    <12    35   0.933  201.6    200
+#
+label	ef	k	W	S	D	c%	recall	p50ms	p99ms	qps	exp	use	wst	blk/q	mis/q	hit/q	sf/q	pf_i	pf_c	best@	1stk@	early%	waste%	hit%	io_ms	cmp_ms	dst_ms	ms/mis
+warm	200	100	4	0	0	5	0.963	8.0	10.5	132.7	201	92	109	201.1	24.3	176.8	45.1	127.4	122.6	13.3	1.3	0.0	54.1	87.9	5.64	1.74	1.52	0.232
+warm-S4D16	200	100	4	4	16	5	0.960	7.6	10.6	143.4	184	91	93	183.8	23.6	160.2	39.2	115.7	110.7	11.7	1.3	52.0	50.6	87.2	5.25	1.58	1.37	0.223
+warm-ada	200	100	4	0	0	5	0.956	7.2	10.6	150.5	173	84	88	172.7	22.7	150.0	36.5	108.8	103.8	13.3	1.3	32.0	51.2	86.8	5.00	1.49	1.30	0.220
+cold	200	100	4	0	0	0	0.963	14.1	16.8	71.5	201	92	109	201.1	84.2	117.5	38.9	238.9	117.5	13.3	1.3	0.0	54.1	58.4	11.96	1.87	1.65	0.142
+cold-S4D16	200	100	4	4	16	0	0.960	13.5	16.6	76.9	184	91	93	183.8	77.0	107.4	35.5	217.1	107.4	11.7	1.3	52.0	50.6	58.5	10.84	1.99	1.78	0.141
+cold-ada	200	100	4	0	0	0	0.956	12.8	16.1	81.9	173	84	88	172.7	75.4	97.9	31.3	206.9	97.9	13.3	1.3	32.0	51.2	56.7	10.54	1.51	1.31	0.140

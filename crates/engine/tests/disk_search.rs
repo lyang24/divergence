@@ -10,14 +10,19 @@ use divergence_core::distance::{
     create_distance_computer, fp32_to_fp16, FP16VectorBank, FP32SimdVectorBank,
     FP32VectorBank, Int8VectorBank, VectorBank,
 };
-use divergence_core::quantization::{ScalarQuantizer, l2_normalize};
+use divergence_core::quantization::{PqCodebook, ScalarQuantizer, l2_normalize, l2_normalize_batch};
 use divergence_core::{MetricType, VectorId};
 use divergence_engine::{
-    disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_refine,
+    disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
+    disk_graph_search_pq, disk_graph_search_refine,
+    AdaEfParams, AdaEfStats, AdaEfTable, estimate_ada_ef,
     AdjacencyPool, IoDriver, PerfLevel, QueryRecorder, SearchGuard, SearchPerfContext,
 };
 use divergence_index::{NswBuilder, NswConfig};
-use divergence_storage::{load_vectors, IndexMeta, IndexWriter};
+use divergence_storage::{
+    load_vectors, IndexMeta, IndexWriter,
+    AdjIndexEntry, bfs_reorder_graph, load_adj_index,
+};
 
 use rand::Rng;
 use rand_xoshiro::rand_core::SeedableRng;
@@ -5807,3 +5812,1957 @@ fn test_calibrate_device() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stable Benchmark Runner
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct BenchConfig {
+    label: String,
+    ef: usize,        // used as max_ef when ada_ef=true
+    k: usize,
+    prefetch_width: usize,
+    stall_limit: u32,  // used as default when ada_ef=false
+    drain_budget: u32,
+    adj_inflight: usize,
+    cache_pct: usize,
+    num_queries: usize,
+    warmup_queries: usize,
+    ada_ef: bool,      // if true, per-query (ef, S, D) from Ada-ef scoring
+    /// If true, clear pool before each query (true cold per-query measurement).
+    clear_per_query: bool,
+}
+
+struct BenchResult {
+    recall: f64,
+    lat_p50_ms: f64,
+    lat_p99_ms: f64,
+    qps: f64,
+    avg_expansions: f64,
+    avg_useful: f64,
+    avg_wasted: f64,
+    avg_blk_q: f64,
+    avg_miss_q: f64,
+    avg_hit_q: f64,
+    avg_singleflight: f64,
+    avg_pf_issued: f64,
+    avg_pf_consumed: f64,
+    avg_best_at: f64,
+    avg_first_topk: f64,
+    early_stop_pct: f64,
+    waste_ratio: f64,
+    hit_rate: f64,
+    /// Physical NVMe IO reads per query (miss loads + prefetch loads + bypasses).
+    avg_phys_reads_q: f64,
+    // Timing breakdown (avg per query, ms)
+    avg_io_wait_ms: f64,
+    avg_compute_ms: f64,
+    avg_dist_ms: f64,
+    // Derived: avg ms per cache miss (io_ms / mis_q)
+    ms_per_miss: f64,
+    // Cache health: total bypasses and evict failures across all queries
+    total_bypasses: u64,
+    total_evict_fail: u64,
+}
+
+async fn run_bench(
+    cfg: &BenchConfig,
+    entry_set: &[VectorId],
+    pool: &Rc<AdjacencyPool>,
+    io: &Rc<IoDriver>,
+    bank: &dyn VectorBank,
+    query_vecs: &[Vec<f32>],
+    ground_truth: &[Vec<u32>],
+    ada: Option<(&AdaEfStats, &AdaEfTable)>,
+    query_scores: &[f64],
+) -> BenchResult {
+    let nq = cfg.num_queries.min(query_vecs.len());
+
+    // Warmup pass
+    for q in query_vecs.iter().take(cfg.warmup_queries) {
+        let mut perf = SearchPerfContext::default();
+        disk_graph_search_pipe(
+            q, entry_set, cfg.k, cfg.ef, cfg.prefetch_width,
+            cfg.stall_limit, cfg.drain_budget,
+            pool, io, bank, &mut perf, PerfLevel::CountOnly,
+        ).await;
+    }
+
+    // Per-query Ada-ef tracking (only populated when ada_ef=true)
+    struct AdaQueryInfo { score: f64, ef_used: usize, recall: f64, blk: u64 }
+    let mut ada_info: Vec<AdaQueryInfo> = Vec::new();
+
+    let mut recalls = Vec::with_capacity(nq);
+    let mut latencies_ms = Vec::with_capacity(nq);
+    let mut sum_exp = 0u64;
+    let mut sum_useful = 0u64;
+    let mut sum_wasted = 0u64;
+    let mut sum_blk = 0u64;
+    let mut sum_miss = 0u64;
+    let mut sum_hit = 0u64;
+    let mut sum_phys_reads = 0u64;
+    let mut sum_sf = 0u64;
+    let mut sum_pf_issued = 0u64;
+    let mut sum_pf_consumed = 0u64;
+    let mut sum_best_at = 0u64;
+    let mut sum_first_topk = 0u64;
+    let mut early_count = 0u64;
+    let mut sum_io_wait_ns = 0u64;
+    let mut sum_compute_ns = 0u64;
+    let mut sum_dist_ns = 0u64;
+
+    let cache_stats_before = pool.stats();
+    let wall_start = std::time::Instant::now();
+
+    for i in 0..nq {
+        let q = &query_vecs[i];
+
+        // Determine per-query params: Ada-ef or fixed
+        let (ef, sl, db, ada_score) = if cfg.ada_ef {
+            if let Some((stats, table)) = ada {
+                // Compute seed distances (same as search seeding — pure DRAM)
+                let seed_dists: Vec<f32> = entry_set
+                    .iter()
+                    .map(|&ep| bank.distance(q, ep.0 as usize))
+                    .collect();
+                // Compute score for diagnostics
+                let (mu, sigma) = stats.estimate_fdl_params(q);
+                let mut thresholds = [0.0f64; 5];
+                for b in 0..5 {
+                    thresholds[b] = mu + sigma * divergence_engine::ada_ef::inv_normal_cdf(0.001 * (b + 1) as f64);
+                }
+                let mut counts = [0u32; 5];
+                for &d in &seed_dists {
+                    let d = d as f64;
+                    for (bin, &thresh) in thresholds.iter().enumerate() {
+                        if d <= thresh { counts[bin] += 1; break; }
+                    }
+                }
+                let weights = [100.0, 36.788, 13.534, 4.979, 1.832];
+                let score: f64 = counts.iter().zip(weights.iter())
+                    .map(|(&c, &w)| w * c as f64 / seed_dists.len() as f64).sum();
+
+                let p = estimate_ada_ef(&seed_dists, stats, q, table);
+                // No ef cap — let hard queries get ef > cfg.ef if table says so
+                (p.ef, p.stall_limit, p.drain_budget, Some(score))
+            } else {
+                (cfg.ef, cfg.stall_limit, cfg.drain_budget, None)
+            }
+        } else {
+            (cfg.ef, cfg.stall_limit, cfg.drain_budget, None)
+        };
+
+        let mut perf = SearchPerfContext::default();
+        let t0 = std::time::Instant::now();
+        let results = disk_graph_search_pipe(
+            q, entry_set, cfg.k, ef, cfg.prefetch_width,
+            sl, db,
+            pool, io, bank, &mut perf, PerfLevel::EnableTime,
+        ).await;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+        latencies_ms.push(elapsed_ms);
+
+        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+        let q_recall = recall_at_k(&ids, &ground_truth[i]);
+        recalls.push(q_recall);
+
+        if let Some(score) = ada_score {
+            ada_info.push(AdaQueryInfo { score, ef_used: ef, recall: q_recall, blk: perf.blocks_read });
+        }
+
+        sum_exp += perf.expansions;
+        sum_useful += perf.useful_expansions;
+        sum_wasted += perf.wasted_expansions;
+        sum_blk += perf.blocks_read;
+        sum_miss += perf.blocks_miss;
+        sum_hit += perf.blocks_hit;
+        sum_phys_reads += perf.phys_reads;
+        sum_sf += perf.singleflight_waits;
+        sum_pf_issued += perf.prefetch_issued;
+        sum_pf_consumed += perf.prefetch_consumed;
+        sum_best_at += perf.best_result_at_expansion;
+        sum_first_topk += perf.first_topk_at_expansion;
+        sum_io_wait_ns += perf.io_wait_ns;
+        sum_compute_ns += perf.compute_ns;
+        sum_dist_ns += perf.dist_ns;
+        if perf.stopped_early {
+            early_count += 1;
+        }
+    }
+
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let nf = nq as f64;
+
+    let mean_recall = recalls.iter().sum::<f64>() / nf;
+    let qps = nf / wall_secs;
+
+    let mut sorted_lat = latencies_ms.clone();
+    sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&sorted_lat, 50.0);
+    let p99 = percentile(&sorted_lat, 99.0);
+
+    let total_exp = sum_useful + sum_wasted;
+    let waste_ratio = if total_exp > 0 { sum_wasted as f64 / total_exp as f64 * 100.0 } else { 0.0 };
+    let hit_rate = if sum_blk > 0 { sum_hit as f64 / sum_blk as f64 * 100.0 } else { 0.0 };
+    let ns_to_ms = 1.0 / 1_000_000.0;
+
+    // Print per-bucket diagnostics for ALL configs (using precomputed query_scores)
+    {
+        let buckets: &[(f64, &str)] = &[
+            (20.0, ">=20"), (16.0, ">=16"), (12.0, ">=12"), (8.0, ">=8"), (0.0, "<8"),
+        ];
+        eprintln!("    {:>8} {:>5} {:>7} {:>6} {:>6} {:>7} {:>7}", "bucket", "n", "recall", "blk/q", "avg_ef", "p99ms", "maxms");
+        for (bi, &(thresh, label)) in buckets.iter().enumerate() {
+            let indices: Vec<usize> = (0..nq).filter(|&i| {
+                let s = query_scores[i];
+                if bi == 0 { s >= thresh }
+                else { s >= thresh && s < buckets[bi - 1].0 }
+            }).collect();
+            if indices.is_empty() { continue; }
+            let n = indices.len();
+            let avg_recall = indices.iter().map(|&i| recalls[i]).sum::<f64>() / n as f64;
+            // Per-bucket latency stats
+            let mut bucket_lats: Vec<f64> = indices.iter().map(|&i| latencies_ms[i]).collect();
+            bucket_lats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let bucket_p99 = percentile(&bucket_lats, 99.0);
+            let bucket_max = bucket_lats.last().copied().unwrap_or(0.0);
+            // blk from ada_info if available, else from per-query perf (not tracked for non-ada)
+            let (avg_blk, avg_ef) = if !ada_info.is_empty() {
+                let blk: f64 = indices.iter().map(|&i| ada_info[i].blk as f64).sum::<f64>() / n as f64;
+                let ef_avg: f64 = indices.iter().map(|&i| ada_info[i].ef_used as f64).sum::<f64>() / n as f64;
+                (blk, ef_avg)
+            } else {
+                (0.0, cfg.ef as f64)
+            };
+            if avg_blk > 0.0 {
+                eprintln!("    {:>8} {:>5} {:>7.3} {:>6.1} {:>6.0} {:>7.1} {:>7.1}", label, n, avg_recall, avg_blk, avg_ef, bucket_p99, bucket_max);
+            } else {
+                eprintln!("    {:>8} {:>5} {:>7.3} {:>6} {:>6.0} {:>7.1} {:>7.1}", label, n, avg_recall, "-", avg_ef, bucket_p99, bucket_max);
+            }
+        }
+    }
+
+    BenchResult {
+        recall: mean_recall,
+        lat_p50_ms: p50,
+        lat_p99_ms: p99,
+        qps,
+        avg_expansions: sum_exp as f64 / nf,
+        avg_useful: sum_useful as f64 / nf,
+        avg_wasted: sum_wasted as f64 / nf,
+        avg_blk_q: sum_blk as f64 / nf,
+        avg_miss_q: sum_miss as f64 / nf,
+        avg_hit_q: sum_hit as f64 / nf,
+        avg_singleflight: sum_sf as f64 / nf,
+        avg_pf_issued: sum_pf_issued as f64 / nf,
+        avg_pf_consumed: sum_pf_consumed as f64 / nf,
+        avg_best_at: sum_best_at as f64 / nf,
+        avg_first_topk: sum_first_topk as f64 / nf,
+        early_stop_pct: early_count as f64 / nf * 100.0,
+        waste_ratio,
+        hit_rate,
+        avg_phys_reads_q: sum_phys_reads as f64 / nf,
+        avg_io_wait_ms: sum_io_wait_ns as f64 / nf * ns_to_ms,
+        avg_compute_ms: sum_compute_ns as f64 / nf * ns_to_ms,
+        avg_dist_ms: sum_dist_ns as f64 / nf * ns_to_ms,
+        ms_per_miss: if sum_miss > 0 {
+            (sum_io_wait_ns as f64 * ns_to_ms) / sum_miss as f64
+        } else {
+            0.0
+        },
+        total_bypasses: pool.stats().bypasses - cache_stats_before.bypasses,
+        total_evict_fail: pool.stats().evict_fail_all_pinned - cache_stats_before.evict_fail_all_pinned,
+    }
+}
+
+/// Run benchmark using v3 page-packed adjacency (key = page_id).
+///
+/// Caller must have a running prefetch worker. For `clear_per_query`, this
+/// function uses pause/drain/wait/clear/unpause — the worker stays alive.
+async fn run_bench_v3(
+    cfg: &BenchConfig,
+    entry_set: &[VectorId],
+    pool: &Rc<AdjacencyPool>,
+    io: &Rc<IoDriver>,
+    bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    query_vecs: &[Vec<f32>],
+    ground_truth: &[Vec<u32>],
+) -> BenchResult {
+    let nq = cfg.num_queries.min(query_vecs.len());
+
+    // Warmup pass
+    for q in query_vecs.iter().take(cfg.warmup_queries) {
+        let mut perf = SearchPerfContext::default();
+        disk_graph_search_pipe_v3(
+            q, entry_set, cfg.k, cfg.ef, cfg.prefetch_width,
+            cfg.stall_limit, cfg.drain_budget,
+            pool, io, bank, adj_index, &mut perf, PerfLevel::CountOnly,
+        ).await;
+    }
+
+    let mut recalls = Vec::with_capacity(nq);
+    let mut latencies_ms = Vec::with_capacity(nq);
+    let mut sum_exp = 0u64;
+    let mut sum_useful = 0u64;
+    let mut sum_wasted = 0u64;
+    let mut sum_blk = 0u64;
+    let mut sum_miss = 0u64;
+    let mut sum_hit = 0u64;
+    let mut sum_phys_reads = 0u64;
+    let mut sum_sf = 0u64;
+    let mut sum_pf_issued = 0u64;
+    let mut sum_pf_consumed = 0u64;
+    let mut sum_best_at = 0u64;
+    let mut sum_first_topk = 0u64;
+    let mut early_count = 0u64;
+    let mut sum_io_wait_ns = 0u64;
+    let mut sum_compute_ns = 0u64;
+    let mut sum_dist_ns = 0u64;
+
+    let cache_stats_before = pool.stats();
+    let wall_start = std::time::Instant::now();
+
+    for i in 0..nq {
+        if cfg.clear_per_query {
+            // Quiesce: pause hints → drain channel → yield → wait LOADING → clear → unpause
+            pool.pause_prefetch(true);
+            pool.drain_prefetch();
+            // Yield once to let already-spawned IO tasks set their LOADING flags
+            monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+            while pool.has_loading() {
+                monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+            }
+            pool.clear();
+            pool.pause_prefetch(false);
+        }
+        let q = &query_vecs[i];
+        let mut perf = SearchPerfContext::default();
+        let t0 = std::time::Instant::now();
+        let results = disk_graph_search_pipe_v3(
+            q, entry_set, cfg.k, cfg.ef, cfg.prefetch_width,
+            cfg.stall_limit, cfg.drain_budget,
+            pool, io, bank, adj_index, &mut perf, PerfLevel::EnableTime,
+        ).await;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+        latencies_ms.push(elapsed_ms);
+
+        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+        let q_recall = recall_at_k(&ids, &ground_truth[i]);
+        recalls.push(q_recall);
+
+        sum_exp += perf.expansions;
+        sum_useful += perf.useful_expansions;
+        sum_wasted += perf.wasted_expansions;
+        sum_blk += perf.blocks_read;
+        sum_miss += perf.blocks_miss;
+        sum_hit += perf.blocks_hit;
+        sum_phys_reads += perf.phys_reads;
+        sum_sf += perf.singleflight_waits;
+        sum_pf_issued += perf.prefetch_issued;
+        sum_pf_consumed += perf.prefetch_consumed;
+        sum_best_at += perf.best_result_at_expansion;
+        sum_first_topk += perf.first_topk_at_expansion;
+        sum_io_wait_ns += perf.io_wait_ns;
+        sum_compute_ns += perf.compute_ns;
+        sum_dist_ns += perf.dist_ns;
+        if perf.stopped_early {
+            early_count += 1;
+        }
+    }
+
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let nf = nq as f64;
+
+    let mean_recall = recalls.iter().sum::<f64>() / nf;
+    let qps = nf / wall_secs;
+
+    let mut sorted_lat = latencies_ms.clone();
+    sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&sorted_lat, 50.0);
+    let p99 = percentile(&sorted_lat, 99.0);
+
+    let total_exp = sum_useful + sum_wasted;
+    let waste_ratio = if total_exp > 0 { sum_wasted as f64 / total_exp as f64 * 100.0 } else { 0.0 };
+    let hit_rate = if sum_blk > 0 { sum_hit as f64 / sum_blk as f64 * 100.0 } else { 0.0 };
+    let ns_to_ms = 1.0 / 1_000_000.0;
+
+    BenchResult {
+        recall: mean_recall,
+        lat_p50_ms: p50,
+        lat_p99_ms: p99,
+        qps,
+        avg_expansions: sum_exp as f64 / nf,
+        avg_useful: sum_useful as f64 / nf,
+        avg_wasted: sum_wasted as f64 / nf,
+        avg_blk_q: sum_blk as f64 / nf,
+        avg_miss_q: sum_miss as f64 / nf,
+        avg_hit_q: sum_hit as f64 / nf,
+        avg_singleflight: sum_sf as f64 / nf,
+        avg_pf_issued: sum_pf_issued as f64 / nf,
+        avg_pf_consumed: sum_pf_consumed as f64 / nf,
+        avg_best_at: sum_best_at as f64 / nf,
+        avg_first_topk: sum_first_topk as f64 / nf,
+        early_stop_pct: early_count as f64 / nf * 100.0,
+        waste_ratio,
+        hit_rate,
+        avg_phys_reads_q: sum_phys_reads as f64 / nf,
+        avg_io_wait_ms: sum_io_wait_ns as f64 / nf * ns_to_ms,
+        avg_compute_ms: sum_compute_ns as f64 / nf * ns_to_ms,
+        avg_dist_ms: sum_dist_ns as f64 / nf * ns_to_ms,
+        ms_per_miss: if sum_miss > 0 {
+            (sum_io_wait_ns as f64 * ns_to_ms) / sum_miss as f64
+        } else {
+            0.0
+        },
+        total_bypasses: pool.stats().bypasses - cache_stats_before.bypasses,
+        total_evict_fail: pool.stats().evict_fail_all_pinned - cache_stats_before.evict_fail_all_pinned,
+    }
+}
+
+fn print_bench_header(n: usize, dim: usize, num_queries: usize, warmup_queries: usize) {
+    eprintln!("\n=== BENCH: Cohere {}K, dim={}, GT=brute-force, seed=42, nq={}, warmup={} ===",
+        n / 1000, dim, num_queries, warmup_queries);
+    eprintln!(
+        "{:<14} {:>4} {:>4} {:>2} {:>3} {:>3} {:>4} {:>7} {:>7} {:>7} {:>7} {:>5} {:>5} {:>5} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>5} {:>6} {:>6} {:>7} {:>7} {:>5} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6}",
+        "label", "ef", "k", "W", "S", "D", "c%",
+        "recall", "p50ms", "p99ms", "qps",
+        "exp", "use", "wst", "blk/q", "mis/q", "phy/q", "hit/q", "sf/q",
+        "pf_i", "pf_c", "best@", "1stk@",
+        "early%", "waste%", "hit%",
+        "io_ms", "cmp_ms", "dst_ms", "ms/mis",
+        "byp", "evfail"
+    );
+}
+
+fn print_bench_row(cfg: &BenchConfig, r: &BenchResult) {
+    eprintln!(
+        "{:<14} {:>4} {:>4} {:>2} {:>3} {:>3} {:>4} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>5.0} {:>5.0} {:>5.0} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>5.1} {:>5.1} {:>5.1} {:>6.1} {:>6.1} {:>7.1} {:>7.1} {:>5.1} {:>7.2} {:>7.2} {:>7.2} {:>6.3} {:>6} {:>6}",
+        cfg.label, cfg.ef, cfg.k, cfg.prefetch_width, cfg.stall_limit, cfg.drain_budget, cfg.cache_pct,
+        r.recall, r.lat_p50_ms, r.lat_p99_ms, r.qps,
+        r.avg_expansions, r.avg_useful, r.avg_wasted,
+        r.avg_blk_q, r.avg_miss_q, r.avg_phys_reads_q, r.avg_hit_q, r.avg_singleflight,
+        r.avg_pf_issued, r.avg_pf_consumed,
+        r.avg_best_at, r.avg_first_topk,
+        r.early_stop_pct, r.waste_ratio, r.hit_rate,
+        r.avg_io_wait_ms, r.avg_compute_ms, r.avg_dist_ms, r.ms_per_miss,
+        r.total_bypasses, r.total_evict_fail
+    );
+}
+
+#[test]
+#[ignore] // EC2-only: BENCH_DIR + COHERE_N required
+fn exp_bench_stable() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let prefetch_budget = 4;
+
+    eprintln!("Building NSW index (n={}, dim={}, m_max={}, ef_c={}) ...", n, dim, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // Write to disk
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let dir_path: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        dir_path = std::path::PathBuf::from(bd);
+        std::fs::create_dir_all(&dir_path).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        dir_path = _tmpdir.path().to_path_buf();
+    }
+    let dir_str = dir_path.to_str().unwrap().to_owned();
+    let writer = IndexWriter::new(&dir_path);
+    writer
+        .write(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+            index.vectors_raw(), |vid| index.neighbors(vid),
+        )
+        .unwrap();
+    eprintln!("  v1 index written to {} (direct_io={})", dir_str, direct_io);
+
+    // Write v3 page-packed adjacency (BFS reorder) into a subdirectory
+    let v3_dir_path = dir_path.join("v3");
+    std::fs::create_dir_all(&v3_dir_path).unwrap();
+    let v3_dir_str = v3_dir_path.to_str().unwrap().to_owned();
+    let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
+    let t0_v3 = std::time::Instant::now();
+    let reorder = bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
+    let v3_writer = IndexWriter::new(&v3_dir_path);
+    v3_writer
+        .write_v3(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &entry_ids,
+            index.vectors_raw(), |vid| index.neighbors(vid),
+            &reorder,
+        )
+        .unwrap();
+    // Copy vectors.dat to v3 dir (IoDriver + VectorBank need same dir)
+    std::fs::copy(dir_path.join("vectors.dat"), v3_dir_path.join("vectors.dat")).unwrap();
+    let v3_meta = IndexMeta::load_from(&v3_dir_path.join("meta.json")).unwrap();
+    eprintln!("  v3 index written to {} ({} pages, BFS reorder) in {:.1}s",
+        v3_dir_str, v3_meta.num_pages.unwrap_or(0), t0_v3.elapsed().as_secs_f64());
+
+    let disk_vectors = load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap();
+    let entry_set: Vec<VectorId> = {
+        let meta = IndexMeta::load_from(&dir_path.join("meta.json")).unwrap();
+        meta.entry_set.iter().map(|&v| VectorId(v)).collect()
+    };
+
+    // Load v3 adj_index into DRAM — use meta.num_vectors, not dataset n
+    let adj_index = load_adj_index(
+        &v3_dir_path.join("adj_index.dat"),
+        v3_meta.num_vectors as usize,
+    ).unwrap();
+    eprintln!("  adj_index loaded: {} entries ({:.1} KB DRAM)",
+        adj_index.len(), adj_index.len() as f64 * 8.0 / 1024.0);
+
+    let num_queries = nq.min(100);
+    let query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(num_queries).map(|c| c.to_vec()).collect();
+
+    let warmup_queries = 10;
+
+    // Compute Ada-ef stats (diagonal-only v0, O(n*d))
+    // Vectors must be L2-normalized for cosine FDL theory.
+    // Cohere vectors are NOT pre-normalized — use from_raw_vectors_cosine().
+    eprintln!("Computing Ada-ef stats (diagonal variance + normalize, n={}, dim={}) ...", n, dim);
+    let ada_stats = AdaEfStats::from_raw_vectors_cosine(&vectors, n, dim);
+
+    // Build Ada-ef table: score thresholds calibrated to observed Cohere 100K distribution.
+    // Score range: ~5-28, median ~14, p25 ~11.
+    // v0.2: ef-only calibration (S=0, D=0 everywhere) to isolate ef effect.
+    // Hard queries get ef>200 to test if more budget recovers recall.
+    let ada_table = AdaEfTable::new(
+        &[
+            (20.0, 150, 0, 0),   // top ~20%: clearly easy
+            (16.0, 170, 0, 0),   // above median
+            (12.0, 190, 0, 0),   // below median
+            (8.0,  200, 0, 0),   // hard
+        ],
+        AdaEfParams { ef: 250, stall_limit: 0, drain_budget: 0 },  // hardest: EXTRA budget
+    );
+
+    // Define benchmark configs: baselines + Ada-ef, both warm and cold
+    let configs = vec![
+        // --- Warm baselines (5% cache) ---
+        BenchConfig {
+            label: "warm".to_string(),
+            ef: 200, k, prefetch_width: 4,
+            stall_limit: 0, drain_budget: 0,
+            adj_inflight: 64, cache_pct: 5,
+            num_queries, warmup_queries,
+            ada_ef: false,
+            clear_per_query: false,
+        },
+        BenchConfig {
+            label: "warm-S4D16".to_string(),
+            ef: 200, k, prefetch_width: 4,
+            stall_limit: 4, drain_budget: 16,
+            adj_inflight: 64, cache_pct: 5,
+            num_queries, warmup_queries,
+            ada_ef: false,
+            clear_per_query: false,
+        },
+        BenchConfig {
+            label: "warm-ada".to_string(),
+            ef: 200, k, prefetch_width: 4,
+            stall_limit: 0, drain_budget: 0,  // overridden per-query
+            adj_inflight: 64, cache_pct: 5,
+            num_queries, warmup_queries,
+            ada_ef: true,
+            clear_per_query: false,
+        },
+        // --- ef sweep (warm): diagnose >=8 bucket ---
+        BenchConfig {
+            label: "warm-ef225".to_string(),
+            ef: 225, k, prefetch_width: 4,
+            stall_limit: 0, drain_budget: 0,
+            adj_inflight: 64, cache_pct: 5,
+            num_queries, warmup_queries,
+            ada_ef: false,
+            clear_per_query: false,
+        },
+        BenchConfig {
+            label: "warm-ef250".to_string(),
+            ef: 250, k, prefetch_width: 4,
+            stall_limit: 0, drain_budget: 0,
+            adj_inflight: 64, cache_pct: 5,
+            num_queries, warmup_queries,
+            ada_ef: false,
+            clear_per_query: false,
+        },
+        BenchConfig {
+            label: "warm-ef300".to_string(),
+            ef: 300, k, prefetch_width: 4,
+            stall_limit: 0, drain_budget: 0,
+            adj_inflight: 64, cache_pct: 5,
+            num_queries, warmup_queries,
+            ada_ef: false,
+            clear_per_query: false,
+        },
+        // --- Cold baselines (0% cache, IO-bound) ---
+        BenchConfig {
+            label: "cold".to_string(),
+            ef: 200, k, prefetch_width: 4,
+            stall_limit: 0, drain_budget: 0,
+            adj_inflight: 64, cache_pct: 0,
+            num_queries, warmup_queries: 0,
+            ada_ef: false,
+            clear_per_query: false,
+        },
+        BenchConfig {
+            label: "cold-S4D16".to_string(),
+            ef: 200, k, prefetch_width: 4,
+            stall_limit: 4, drain_budget: 16,
+            adj_inflight: 64, cache_pct: 0,
+            num_queries, warmup_queries: 0,
+            ada_ef: false,
+            clear_per_query: false,
+        },
+        BenchConfig {
+            label: "cold-ada".to_string(),
+            ef: 200, k, prefetch_width: 4,
+            stall_limit: 0, drain_budget: 0,  // overridden per-query
+            adj_inflight: 64, cache_pct: 0,
+            num_queries, warmup_queries: 0,
+            ada_ef: true,
+            clear_per_query: false,
+        },
+    ];
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let io = Rc::new(
+                IoDriver::open(&dir_str, dim, 64, direct_io)
+                    .await
+                    .expect("failed to open IO driver"),
+            );
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // Precompute per-query Ada-ef scores (used for both diagnostics and bucket breakdown)
+            let query_scores: Vec<f64> = {
+                let mut scores = Vec::with_capacity(num_queries);
+                for q in &query_vecs {
+                    let seed_dists: Vec<f32> = entry_set
+                        .iter()
+                        .map(|&ep| bank.distance(q, ep.0 as usize))
+                        .collect();
+                    let (mu, sigma) = ada_stats.estimate_fdl_params(q);
+                    let mut thresholds = [0.0f64; 5];
+                    for i in 0..5 {
+                        thresholds[i] = mu + sigma * divergence_engine::ada_ef::inv_normal_cdf(0.001 * (i + 1) as f64);
+                    }
+                    let mut counts = [0u32; 5];
+                    for &d in &seed_dists {
+                        let d = d as f64;
+                        for (bin, &thresh) in thresholds.iter().enumerate() {
+                            if d <= thresh { counts[bin] += 1; break; }
+                        }
+                    }
+                    let n_seeds = seed_dists.len() as f64;
+                    let weights = [100.0, 36.788, 13.534, 4.979, 1.832];
+                    let score: f64 = counts.iter().zip(weights.iter())
+                        .map(|(&c, &w)| w * c as f64 / n_seeds).sum();
+                    scores.push(score);
+                }
+                scores
+            };
+
+            // Print score distribution
+            {
+                let mut sorted = query_scores.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                eprintln!(
+                    "\nAda-ef score distribution (nq={}): min={:.2} p25={:.2} p50={:.2} mean={:.2} p75={:.2} max={:.2}",
+                    sorted.len(), sorted[0], sorted[sorted.len()/4], sorted[sorted.len()/2],
+                    sorted.iter().sum::<f64>() / sorted.len() as f64,
+                    sorted[3*sorted.len()/4], sorted[sorted.len()-1]
+                );
+                let buckets = [20.0, 16.0, 12.0, 8.0, 0.0];
+                let labels = [">=20 (ef=150)", ">=16 (ef=170)", ">=12 (ef=190)", ">=8 (ef=200)", "<8 (floor=250)"];
+                for (i, &thresh) in buckets.iter().enumerate() {
+                    let count = if i == 0 {
+                        query_scores.iter().filter(|&&s| s >= thresh).count()
+                    } else {
+                        query_scores.iter().filter(|&&s| s >= thresh && s < buckets[i-1]).count()
+                    };
+                    eprintln!("  {}: {} queries ({:.0}%)", labels[i], count, count as f64 / query_scores.len() as f64 * 100.0);
+                }
+            }
+
+            print_bench_header(n, dim, num_queries, warmup_queries);
+
+            for cfg in &configs {
+                // cache_pct=0 → single 8-way set (32KB), truly cold
+                let pool_bytes = if cfg.cache_pct > 0 {
+                    n * 4096 * cfg.cache_pct / 100
+                } else {
+                    8 * 4096 // one set
+                };
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+
+                let ada = if cfg.ada_ef {
+                    Some((&ada_stats, &ada_table))
+                } else {
+                    None
+                };
+
+                let result = run_bench(
+                    cfg, &entry_set, &pool, &io, &bank,
+                    &query_vecs, &ground_truth, ada, &query_scores,
+                ).await;
+
+                print_bench_row(cfg, &result);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // =================================================================
+            // v3 page-packed adjacency benchmarks
+            // =================================================================
+            eprintln!("\n--- v3 page-packed adjacency (BFS reorder) ---");
+
+            let io_v3 = Rc::new(
+                IoDriver::open_pages(&v3_dir_str, dim, 64, direct_io)
+                    .await
+                    .expect("failed to open v3 IO driver"),
+            );
+
+            let v3_configs = vec![
+                // --- Steady-state (cross-query cache warms up) ---
+                BenchConfig {
+                    label: "v3-warm".to_string(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct: 5,
+                    num_queries, warmup_queries,
+                    ada_ef: false,
+                    clear_per_query: false,
+                },
+                BenchConfig {
+                    label: "v3-warm-S4D16".to_string(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 4, drain_budget: 16,
+                    adj_inflight: 64, cache_pct: 5,
+                    num_queries, warmup_queries,
+                    ada_ef: false,
+                    clear_per_query: false,
+                },
+                // Cold steady-state (starts cold, warms across queries)
+                BenchConfig {
+                    label: "v3-cold".to_string(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct: 0,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: false,
+                },
+                // --- Per-query cold: pool.clear() before each query ---
+                // Isolates intra-query page reuse (no cross-query warming)
+                // Should approach simulation's ~135 phys_reads/q
+                BenchConfig {
+                    label: "v3-perq-cold".to_string(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct: 0,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                },
+                BenchConfig {
+                    label: "v3-perq-S4D16".to_string(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 4, drain_budget: 16,
+                    adj_inflight: 64, cache_pct: 0,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                },
+            ];
+
+            let v3_num_pages = v3_meta.num_pages.unwrap_or(0) as usize;
+
+            for cfg in &v3_configs {
+                // v3 pool sizing: key is page_id, not vid.
+                // cache_pct=0 → 256 pages (1MB) to allow intra-query page reuse
+                //   (p99 = ~164 unique pages/q; below this, eviction kills reuse)
+                // cache_pct>0 → pct of total pages, min 256
+                let pool_pages = if cfg.cache_pct > 0 {
+                    (v3_num_pages * cfg.cache_pct / 100).max(256)
+                } else {
+                    256 // ~1MB, enough for intra-query reuse
+                };
+                let pool_bytes = pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io_v3), prefetch_budget,
+                );
+
+                let result = run_bench_v3(
+                    cfg, &entry_set, &pool, &io_v3, &bank,
+                    &adj_index, &query_vecs, &ground_truth,
+                ).await;
+                print_bench_row(cfg, &result);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // =================================================================
+            // Hub pinning benchmark: pin first N pages, measure benefit
+            // =================================================================
+            eprintln!("\n--- Hub pinning (v3, BFS-reordered pages) ---");
+            print_bench_header(n, dim, num_queries, 0);
+
+            for &pin_count in &[64u32, 128u32] {
+                let pin_pages: Vec<u32> = (0..pin_count).collect();
+
+                // v3-perq-pinN: per-query cold with pinned hub pages
+                {
+                    let pool_pages = 256usize; // 1MB
+                    let pool_bytes = pool_pages * 4096;
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    // Pin before starting worker
+                    let actually_pinned = pool.pin_pages(&pin_pages, &io_v3).await
+                        .expect("pin_pages failed");
+                    eprintln!("  pin{}: requested={}, actually_pinned={}", pin_count, pin_count, actually_pinned);
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io_v3), prefetch_budget,
+                    );
+
+                    let cfg = BenchConfig {
+                        label: format!("v3-perq-pin{}", pin_count),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct: 0,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let result = run_bench_v3(
+                        &cfg, &entry_set, &pool, &io_v3, &bank,
+                        &adj_index, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // v3-warm-pinN: warm cache with pinned hub pages
+                {
+                    let pool_pages = (v3_num_pages * 5 / 100).max(256);
+                    let pool_bytes = pool_pages * 4096;
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    // Pin BEFORE starting prefetch worker
+                    let actually_pinned = pool.pin_pages(&pin_pages, &io_v3).await
+                        .expect("pin_pages failed");
+                    eprintln!("  pin{}: requested={}, actually_pinned={}", pin_count, pin_count, actually_pinned);
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io_v3), prefetch_budget,
+                    );
+
+                    let cfg = BenchConfig {
+                        label: format!("v3-warm-pin{}", pin_count),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct: 5,
+                        num_queries, warmup_queries,
+                        ada_ef: false,
+                        clear_per_query: false,
+                    };
+                    let result = run_bench_v3(
+                        &cfg, &entry_set, &pool, &io_v3, &bank,
+                        &adj_index, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+            }
+
+            // =================================================================
+            // Equal-budget comparison: same pool_bytes for v1 vs v3
+            // Separates "page packing wins" from "pool sizing wins"
+            // All per-query cold (pool.clear() before each query)
+            // =================================================================
+            eprintln!("\n--- Equal-budget comparison (v1 vs v3, same pool_bytes, perq-cold) ---");
+            print_bench_header(n, dim, num_queries, 0);
+
+            let budget_sizes: Vec<(usize, &str)> = vec![
+                (32 * 1024, "32KB"),
+                (256 * 1024, "256KB"),
+                (1024 * 1024, "1MB"),
+                (4 * 1024 * 1024, "4MB"),
+            ];
+
+            for &(budget_bytes, budget_label) in &budget_sizes {
+                // v1 with this budget, per-query cold
+                {
+                    let label = format!("v1-{}", budget_label);
+                    let pool = Rc::new(AdjacencyPool::new(budget_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+                    let cfg = BenchConfig {
+                        label, ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct: 0,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    // run_bench doesn't support clear_per_query, so inline the loop
+                    let mut recalls = Vec::with_capacity(num_queries);
+                    let mut latencies_ms = Vec::with_capacity(num_queries);
+                    let mut sum_exp = 0u64;
+                    let mut sum_useful = 0u64;
+                    let mut sum_wasted = 0u64;
+                    let mut sum_blk = 0u64;
+                    let mut sum_miss = 0u64;
+                    let mut sum_hit = 0u64;
+                    let mut sum_phys_reads = 0u64;
+                    let mut sum_sf = 0u64;
+                    let mut sum_pf_issued = 0u64;
+                    let mut sum_pf_consumed = 0u64;
+                    let mut sum_io_wait_ns = 0u64;
+                    let mut sum_compute_ns = 0u64;
+                    let mut sum_dist_ns = 0u64;
+                    let wall_start = std::time::Instant::now();
+
+                    for i in 0..num_queries {
+                        // Quiesce: pause → drain → yield → wait LOADING → clear → unpause
+                        pool.pause_prefetch(true);
+                        pool.drain_prefetch();
+                        monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                        while pool.has_loading() {
+                            monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                        }
+                        pool.clear();
+                        pool.pause_prefetch(false);
+                        let q = &query_vecs[i];
+                        let mut perf = SearchPerfContext::default();
+                        let t0 = std::time::Instant::now();
+                        let results = disk_graph_search_pipe(
+                            q, &entry_set, k, 200, 4, 0, 0,
+                            &pool, &io, &bank, &mut perf, PerfLevel::EnableTime,
+                        ).await;
+                        latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+                        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                        recalls.push(recall_at_k(&ids, &ground_truth[i]));
+                        sum_exp += perf.expansions;
+                        sum_useful += perf.useful_expansions;
+                        sum_wasted += perf.wasted_expansions;
+                        sum_blk += perf.blocks_read;
+                        sum_miss += perf.blocks_miss;
+                        sum_hit += perf.blocks_hit;
+                        sum_phys_reads += perf.phys_reads;
+                        sum_sf += perf.singleflight_waits;
+                        sum_pf_issued += perf.prefetch_issued;
+                        sum_pf_consumed += perf.prefetch_consumed;
+                        sum_io_wait_ns += perf.io_wait_ns;
+                        sum_compute_ns += perf.compute_ns;
+                        sum_dist_ns += perf.dist_ns;
+                    }
+
+                    let nf = num_queries as f64;
+                    let wall_secs = wall_start.elapsed().as_secs_f64();
+                    let mut sorted_lat = latencies_ms.clone();
+                    sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let total_exp = sum_useful + sum_wasted;
+                    let ns_to_ms = 1.0 / 1_000_000.0;
+                    let result = BenchResult {
+                        recall: recalls.iter().sum::<f64>() / nf,
+                        lat_p50_ms: percentile(&sorted_lat, 50.0),
+                        lat_p99_ms: percentile(&sorted_lat, 99.0),
+                        qps: nf / wall_secs,
+                        avg_expansions: sum_exp as f64 / nf,
+                        avg_useful: sum_useful as f64 / nf,
+                        avg_wasted: sum_wasted as f64 / nf,
+                        avg_blk_q: sum_blk as f64 / nf,
+                        avg_miss_q: sum_miss as f64 / nf,
+                        avg_hit_q: sum_hit as f64 / nf,
+                        avg_singleflight: sum_sf as f64 / nf,
+                        avg_pf_issued: sum_pf_issued as f64 / nf,
+                        avg_pf_consumed: sum_pf_consumed as f64 / nf,
+                        avg_best_at: 0.0, avg_first_topk: 0.0,
+                        early_stop_pct: 0.0,
+                        waste_ratio: if total_exp > 0 { sum_wasted as f64 / total_exp as f64 * 100.0 } else { 0.0 },
+                        hit_rate: if sum_blk > 0 { sum_hit as f64 / sum_blk as f64 * 100.0 } else { 0.0 },
+                        avg_phys_reads_q: sum_phys_reads as f64 / nf,
+                        avg_io_wait_ms: sum_io_wait_ns as f64 / nf * ns_to_ms,
+                        avg_compute_ms: sum_compute_ns as f64 / nf * ns_to_ms,
+                        avg_dist_ms: sum_dist_ns as f64 / nf * ns_to_ms,
+                        ms_per_miss: if sum_miss > 0 { (sum_io_wait_ns as f64 * ns_to_ms) / sum_miss as f64 } else { 0.0 },
+                        total_bypasses: pool.stats().bypasses,
+                        total_evict_fail: pool.stats().evict_fail_all_pinned,
+                    };
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // v3 with same budget, per-query cold
+                {
+                    let label = format!("v3-{}", budget_label);
+                    let pool = Rc::new(AdjacencyPool::new(budget_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io_v3), prefetch_budget,
+                    );
+                    let cfg = BenchConfig {
+                        label, ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct: 0,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let result = run_bench_v3(
+                        &cfg, &entry_set, &pool, &io_v3, &bank,
+                        &adj_index, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+            }
+        });
+    }) {
+        eprintln!("SKIPPED: io_uring not available");
+    }
+}
+
+// ============================================================================
+// EXP-PQ-GATE: Inline PQ gating sweep
+// ============================================================================
+
+#[test]
+#[ignore] // EC2-only: BENCH_DIR + COHERE_N required
+fn exp_pq_gate() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+
+    eprintln!("=== EXP-PQ-GATE: Cohere {}K, dim={}, k={} ===", n / 1000, dim, k);
+
+    // 1. Build NSW index
+    eprintln!("Building NSW index (n={}, m_max={}, ef_c={}) ...", n, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // 2. Train PQ codebook on L2-normalized vectors (cosine → IP on unit sphere)
+    let pq_m = if dim % 48 == 0 { 48 } else if dim % 32 == 0 { 32 } else { 16 };
+    eprintln!("Training PQ codebook (M={}, subspace_dim={}) ...", pq_m, dim / pq_m);
+    let t0 = std::time::Instant::now();
+    let mut norm_vectors = vectors.clone();
+    l2_normalize_batch(&mut norm_vectors, dim);
+    let codebook = PqCodebook::train(&norm_vectors, n, dim, pq_m, 20, 42);
+    eprintln!("  PQ trained in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // 3. Encode all vectors
+    eprintln!("Encoding all vectors ...");
+    let t0 = std::time::Instant::now();
+    let pq_codes_all = codebook.encode_all(&norm_vectors, n);
+    eprintln!("  Encoded in {:.1}s ({} bytes)", t0.elapsed().as_secs_f64(), pq_codes_all.len());
+
+    // 4. Write v2 index to disk
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let dir_path: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        dir_path = std::path::PathBuf::from(bd).join("pq_gate");
+        std::fs::create_dir_all(&dir_path).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        dir_path = _tmpdir.path().to_path_buf();
+    }
+    let dir_str = dir_path.to_str().unwrap().to_owned();
+
+    eprintln!("Writing v2 index to {} ...", dir_str);
+    let writer = IndexWriter::new(&dir_path);
+    writer
+        .write_v2(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+            index.vectors_raw(), |vid| index.neighbors(vid),
+            &codebook, &pq_codes_all, "ip",
+        )
+        .unwrap();
+    eprintln!("  v2 index written (direct_io={})", direct_io);
+
+    // 5. Run gate_ratio sweep
+    let disk_vectors = load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap();
+    let entry_set: Vec<VectorId> = {
+        let meta = IndexMeta::load_from(&dir_path.join("meta.json")).unwrap();
+        meta.entry_set.iter().map(|&v| VectorId(v)).collect()
+    };
+
+    let num_queries = nq.min(100);
+    let query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(num_queries).map(|c| c.to_vec()).collect();
+
+    let ef = 200;
+    let prefetch_width = 4;
+    let prefetch_budget = 4;
+    let warmup_queries = 10;
+
+    // Gate ratio configs: 1.0 = no gating (baseline), then decreasing
+    let gate_configs: Vec<(f32, usize)> = vec![
+        (1.0,  4),   // baseline: no gating
+        (0.75, 4),   // keep 75%
+        (0.50, 4),   // keep 50%
+        (0.33, 4),   // keep 33%
+        (0.25, 4),   // keep 25%
+    ];
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let io = Rc::new(
+                IoDriver::open(&dir_str, dim, 64, direct_io)
+                    .await
+                    .expect("failed to open IO driver"),
+            );
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // TSV header
+            eprintln!(
+                "\n{:>10} {:>5} {:>3} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>7} {:>7}",
+                "gate", "gmin", "ef", "recall", "p50ms", "p99ms", "qps",
+                "exp/q", "blk/q", "mis/q", "pq_scrd", "pq_pass", "pq_filt",
+                "use/q", "wst/q"
+            );
+
+            for &(gate_ratio, gate_min) in &gate_configs {
+                let pool_bytes = n * 4096 * 5 / 100; // 5% cache
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+
+                // Warmup
+                for q in query_vecs.iter().take(warmup_queries) {
+                    let mut norm_q = q.clone();
+                    l2_normalize(&mut norm_q);
+                    let pq_dt = codebook.build_distance_table(&norm_q, true);
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pq(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &bank, &mut perf, PerfLevel::CountOnly,
+                        Some(&pq_dt), gate_ratio, gate_min,
+                    ).await;
+                }
+
+                // Measure
+                let mut recalls = Vec::with_capacity(num_queries);
+                let mut latencies_ms = Vec::with_capacity(num_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_useful = 0u64;
+                let mut sum_wasted = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_pq_scored = 0u64;
+                let mut sum_pq_passed = 0u64;
+                let mut sum_pq_filtered = 0u64;
+
+                let wall_start = std::time::Instant::now();
+
+                for i in 0..num_queries {
+                    let q = &query_vecs[i];
+                    let mut norm_q = q.clone();
+                    l2_normalize(&mut norm_q);
+                    let pq_dt = codebook.build_distance_table(&norm_q, true);
+
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pq(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &bank, &mut perf, PerfLevel::EnableTime,
+                        Some(&pq_dt), gate_ratio, gate_min,
+                    ).await;
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+                    latencies_ms.push(elapsed_ms);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &ground_truth[i]));
+
+                    sum_exp += perf.expansions;
+                    sum_useful += perf.useful_expansions;
+                    sum_wasted += perf.wasted_expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_pq_scored += perf.pq_candidates_scored;
+                    sum_pq_passed += perf.pq_candidates_passed;
+                    sum_pq_filtered += perf.pq_candidates_filtered;
+                }
+
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_queries as f64;
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                eprintln!(
+                    "{:>10.2} {:>5} {:>3} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>7.1} {:>7.1}",
+                    gate_ratio, gate_min, ef,
+                    mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_pq_scored as f64 / nf,
+                    sum_pq_passed as f64 / nf,
+                    sum_pq_filtered as f64 / nf,
+                    sum_useful as f64 / nf,
+                    sum_wasted as f64 / nf,
+                );
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+        });
+    }) {
+        eprintln!("SKIPPED: io_uring not available");
+    }
+}
+
+// ============================================================================
+// EXP-PQ-GATE-V2: Iso-recall ef sweep + gating×stopping combo
+//
+// Two questions:
+//   1. Does PQ gating shift the recall-vs-ef curve left?
+//      (same recall at lower ef → fewer blk/q)
+//   2. Does gating + adaptive stopping (S/D) together beat either alone?
+// ============================================================================
+
+struct PqGateConfig {
+    label: String,
+    ef: usize,
+    gate_ratio: f32,
+    gate_min: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+}
+
+#[test]
+#[ignore] // EC2-only: BENCH_DIR + COHERE_N required
+fn exp_pq_gate_v2() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+
+    eprintln!("=== EXP-PQ-GATE-V2: Cohere {}K, dim={}, k={} ===", n / 1000, dim, k);
+
+    // 1. Build NSW index
+    eprintln!("Building NSW index (n={}, m_max={}, ef_c={}) ...", n, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // 2. Train PQ codebook
+    let pq_m = if dim % 48 == 0 { 48 } else if dim % 32 == 0 { 32 } else { 16 };
+    eprintln!("Training PQ codebook (M={}, subspace_dim={}) ...", pq_m, dim / pq_m);
+    let t0 = std::time::Instant::now();
+    let mut norm_vectors = vectors.clone();
+    l2_normalize_batch(&mut norm_vectors, dim);
+    let codebook = PqCodebook::train(&norm_vectors, n, dim, pq_m, 20, 42);
+    eprintln!("  PQ trained in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // 3. Encode all vectors
+    let t0 = std::time::Instant::now();
+    let pq_codes_all = codebook.encode_all(&norm_vectors, n);
+    eprintln!("  Encoded in {:.1}s ({} bytes)", t0.elapsed().as_secs_f64(), pq_codes_all.len());
+
+    // 4. Write v2 index
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let dir_path: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        dir_path = std::path::PathBuf::from(bd).join("pq_gate_v2");
+        std::fs::create_dir_all(&dir_path).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        dir_path = _tmpdir.path().to_path_buf();
+    }
+    let dir_str = dir_path.to_str().unwrap().to_owned();
+
+    eprintln!("Writing v2 index to {} ...", dir_str);
+    let writer = IndexWriter::new(&dir_path);
+    writer
+        .write_v2(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &index.entry_set().iter().map(|v| v.0).collect::<Vec<_>>(),
+            index.vectors_raw(), |vid| index.neighbors(vid),
+            &codebook, &pq_codes_all, "ip",
+        )
+        .unwrap();
+    eprintln!("  v2 index written (direct_io={})", direct_io);
+
+    // 5. Load for search
+    let disk_vectors = load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap();
+    let entry_set: Vec<VectorId> = {
+        let meta = IndexMeta::load_from(&dir_path.join("meta.json")).unwrap();
+        meta.entry_set.iter().map(|&v| VectorId(v)).collect()
+    };
+
+    let num_queries = nq.min(100);
+    let query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(num_queries).map(|c| c.to_vec()).collect();
+
+    let prefetch_width = 4;
+    let prefetch_budget = 4;
+    let warmup_queries = 10;
+
+    // === Experiment configs ===
+    let mut configs: Vec<PqGateConfig> = Vec::new();
+
+    // Part 1: Iso-recall ef sweep — gate × ef
+    for &ef in &[120, 140, 160, 180, 200] {
+        configs.push(PqGateConfig {
+            label: format!("g1.0-ef{}", ef),
+            ef, gate_ratio: 1.0, gate_min: 4,
+            stall_limit: 0, drain_budget: 0,
+        });
+    }
+    for &ef in &[120, 140, 160, 180, 200] {
+        configs.push(PqGateConfig {
+            label: format!("g.75-ef{}", ef),
+            ef, gate_ratio: 0.75, gate_min: 4,
+            stall_limit: 0, drain_budget: 0,
+        });
+    }
+    for &ef in &[120, 140, 160, 180, 200] {
+        configs.push(PqGateConfig {
+            label: format!("g.50-ef{}", ef),
+            ef, gate_ratio: 0.50, gate_min: 4,
+            stall_limit: 0, drain_budget: 0,
+        });
+    }
+
+    // Part 2: Gating × Stopping combo (ef=200)
+    configs.push(PqGateConfig {
+        label: "S4D16".to_string(),
+        ef: 200, gate_ratio: 1.0, gate_min: 4,
+        stall_limit: 4, drain_budget: 16,
+    });
+    configs.push(PqGateConfig {
+        label: "S4D8".to_string(),
+        ef: 200, gate_ratio: 1.0, gate_min: 4,
+        stall_limit: 4, drain_budget: 8,
+    });
+    configs.push(PqGateConfig {
+        label: "g.75+S4D16".to_string(),
+        ef: 200, gate_ratio: 0.75, gate_min: 4,
+        stall_limit: 4, drain_budget: 16,
+    });
+    configs.push(PqGateConfig {
+        label: "g.75+S4D8".to_string(),
+        ef: 200, gate_ratio: 0.75, gate_min: 4,
+        stall_limit: 4, drain_budget: 8,
+    });
+    configs.push(PqGateConfig {
+        label: "g.50+S4D16".to_string(),
+        ef: 200, gate_ratio: 0.50, gate_min: 4,
+        stall_limit: 4, drain_budget: 16,
+    });
+    configs.push(PqGateConfig {
+        label: "g.50+S4D8".to_string(),
+        ef: 200, gate_ratio: 0.50, gate_min: 4,
+        stall_limit: 4, drain_budget: 8,
+    });
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let io = Rc::new(
+                IoDriver::open(&dir_str, dim, 64, direct_io)
+                    .await
+                    .expect("failed to open IO driver"),
+            );
+            let bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // TSV header
+            eprintln!(
+                "\n{:>14} {:>3} {:>5} {:>4} {:>3} {:>3} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>6}",
+                "label", "ef", "gate", "gmin", "S", "D", "recall", "p50ms", "p99ms", "qps",
+                "exp/q", "blk/q", "mis/q", "pq_pass", "pq_filt",
+                "use/q", "wst/q", "early%"
+            );
+
+            for cfg in &configs {
+                let pool_bytes = n * 4096 * 5 / 100; // 5% cache
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+
+                // Warmup
+                for q in query_vecs.iter().take(warmup_queries) {
+                    let mut norm_q = q.clone();
+                    l2_normalize(&mut norm_q);
+                    let pq_dt = codebook.build_distance_table(&norm_q, true);
+                    let pq_ref = if cfg.gate_ratio < 1.0 { Some(&pq_dt) } else { None };
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pq(
+                        q, &entry_set, k, cfg.ef, prefetch_width,
+                        cfg.stall_limit, cfg.drain_budget,
+                        &pool, &io, &bank, &mut perf, PerfLevel::CountOnly,
+                        pq_ref, cfg.gate_ratio, cfg.gate_min,
+                    ).await;
+                }
+
+                // Measure
+                let mut recalls = Vec::with_capacity(num_queries);
+                let mut latencies_ms = Vec::with_capacity(num_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_useful = 0u64;
+                let mut sum_wasted = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_pq_passed = 0u64;
+                let mut sum_pq_filtered = 0u64;
+                let mut early_count = 0u64;
+
+                let wall_start = std::time::Instant::now();
+
+                for i in 0..num_queries {
+                    let q = &query_vecs[i];
+                    let mut norm_q = q.clone();
+                    l2_normalize(&mut norm_q);
+                    let pq_dt = codebook.build_distance_table(&norm_q, true);
+                    let pq_ref = if cfg.gate_ratio < 1.0 { Some(&pq_dt) } else { None };
+
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pq(
+                        q, &entry_set, k, cfg.ef, prefetch_width,
+                        cfg.stall_limit, cfg.drain_budget,
+                        &pool, &io, &bank, &mut perf, PerfLevel::EnableTime,
+                        pq_ref, cfg.gate_ratio, cfg.gate_min,
+                    ).await;
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+                    latencies_ms.push(elapsed_ms);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &ground_truth[i]));
+
+                    sum_exp += perf.expansions;
+                    sum_useful += perf.useful_expansions;
+                    sum_wasted += perf.wasted_expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_pq_passed += perf.pq_candidates_passed;
+                    sum_pq_filtered += perf.pq_candidates_filtered;
+                    if perf.stopped_early { early_count += 1; }
+                }
+
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_queries as f64;
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                eprintln!(
+                    "{:>14} {:>3} {:>5.2} {:>4} {:>3} {:>3} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>8.1} {:>8.1} {:>7.1} {:>7.1} {:>6.1}",
+                    cfg.label, cfg.ef, cfg.gate_ratio, cfg.gate_min,
+                    cfg.stall_limit, cfg.drain_budget,
+                    mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_pq_passed as f64 / nf,
+                    sum_pq_filtered as f64 / nf,
+                    sum_useful as f64 / nf,
+                    sum_wasted as f64 / nf,
+                    early_count as f64 / nf * 100.0,
+                );
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+        });
+    }) {
+        eprintln!("SKIPPED: io_uring not available");
+    }
+}
+
+// ============================================================================
+// EXP-PAGE-TRACE: Trace-driven page packing simulation
+//
+// Collects expansion VID traces from in-memory beam search, then simulates
+// how many unique pages would be read under different:
+//   - nodes_per_page: 4, 8, 16, 24, 32, 48, 64
+//   - reorder strategies: none (sequential), BFS from entry points
+//
+// No NVMe needed — pure in-memory simulation.
+// ============================================================================
+
+/// Beam search that records the VID expansion order (trace).
+fn traced_beam_search(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    index: &divergence_index::NswIndex,
+) -> (Vec<divergence_index::ScoredId>, Vec<u32>) {
+    use divergence_index::{CandidateHeap, FixedCapacityHeap, ScoredId};
+
+    let n = index.num_vectors();
+    let dim = index.dimension();
+    let dist = create_distance_computer(index.metric());
+    let mut visited = vec![false; n];
+    let mut nearest = FixedCapacityHeap::new(ef);
+    let mut candidates = CandidateHeap::new();
+    let mut trace: Vec<u32> = Vec::new();
+
+    for &ep in entry_set {
+        let vid = ep.0 as usize;
+        if vid < n {
+            visited[vid] = true;
+            let d = dist.distance(query, &index.vectors_raw()[vid * dim..(vid + 1) * dim]);
+            let scored = ScoredId { distance: d, id: ep };
+            nearest.push(scored);
+            candidates.push(scored);
+        }
+    }
+
+    while let Some(candidate) = candidates.pop() {
+        if let Some(furthest) = nearest.furthest() {
+            if candidate.distance > furthest.distance {
+                break;
+            }
+        }
+        trace.push(candidate.id.0);
+
+        for &nbr_raw in index.neighbors(candidate.id.0) {
+            let nbr_idx = nbr_raw as usize;
+            if nbr_idx >= n || visited[nbr_idx] {
+                continue;
+            }
+            visited[nbr_idx] = true;
+            let d = dist.distance(query, &index.vectors_raw()[nbr_idx * dim..(nbr_idx + 1) * dim]);
+            let dominated = nearest.len() >= ef && d >= nearest.furthest().unwrap().distance;
+            if !dominated {
+                let scored = ScoredId { distance: d, id: VectorId(nbr_raw) };
+                candidates.push(scored);
+                nearest.push(scored);
+            }
+        }
+    }
+
+    let mut results = nearest.into_sorted_vec();
+    results.truncate(k);
+    (results, trace)
+}
+
+/// BFS reorder: traverse graph BFS from entry set, assign new VIDs in visit order.
+/// Returns old_to_new[old_vid] = new_vid.
+fn bfs_reorder<'a>(n: usize, entry_set: &[VectorId], neighbors_fn: impl Fn(u32) -> &'a [u32]) -> Vec<u32> {
+    let mut old_to_new = vec![u32::MAX; n];
+    let mut queue = std::collections::VecDeque::new();
+    let mut next_id = 0u32;
+
+    for &ep in entry_set {
+        let v = ep.0 as usize;
+        if v < n && old_to_new[v] == u32::MAX {
+            old_to_new[v] = next_id;
+            next_id += 1;
+            queue.push_back(v);
+        }
+    }
+
+    while let Some(v) = queue.pop_front() {
+        for &nbr in neighbors_fn(v as u32) {
+            let ni = nbr as usize;
+            if ni < n && old_to_new[ni] == u32::MAX {
+                old_to_new[ni] = next_id;
+                next_id += 1;
+                queue.push_back(ni);
+            }
+        }
+    }
+
+    // Unreachable nodes (shouldn't happen in connected graph)
+    for i in 0..n {
+        if old_to_new[i] == u32::MAX {
+            old_to_new[i] = next_id;
+            next_id += 1;
+        }
+    }
+
+    old_to_new
+}
+
+/// Simulate page reads for a trace given vid→page_id mapping.
+/// Returns number of unique pages touched (= within-query page reads assuming
+/// query-local cache holds all pages for the query's duration).
+fn simulate_page_reads_mapped(trace: &[u32], vid_to_page: &[u32]) -> usize {
+    let mut seen_pages = std::collections::HashSet::new();
+    for &vid in trace {
+        seen_pages.insert(vid_to_page[vid as usize]);
+    }
+    seen_pages.len()
+}
+
+/// Byte-accurate page packing: greedily pack adjacency records into PAGE_SIZE
+/// pages in reorder order. Returns vid_to_page[old_vid] = page_id.
+///
+/// Page layout:
+///   [page_header: 4B] (num_entries: u16, reserved: u16)
+///   [directory: num_entries × 8B] (vid: u32, offset_within_page: u16, degree: u16)
+///   [records: variable] (degree × 4B neighbor VIDs per entry)
+///
+/// Records are packed contiguously after the directory. If the next node
+/// doesn't fit, a new page is started.
+fn byte_pack_pages(
+    n: usize,
+    reorder: &[u32],          // old_to_new[old_vid] = new_vid
+    degrees: &[u16],          // degrees[old_vid] = degree
+    page_size: usize,
+) -> (Vec<u32>, PackingStats) {
+    const PAGE_HEADER: usize = 4;   // num_entries(u16) + reserved(u16)
+    const DIR_ENTRY: usize = 8;     // vid(u32) + offset(u16) + degree(u16)
+
+    // Build new_to_old so we can iterate in reorder order
+    let mut new_to_old = vec![0u32; n];
+    for old in 0..n {
+        new_to_old[reorder[old] as usize] = old as u32;
+    }
+
+    let mut vid_to_page = vec![0u32; n];
+    let mut page_id = 0u32;
+    let mut page_used = PAGE_HEADER; // start with header
+    let mut entries_on_page = 0usize;
+    let mut total_pages = 0u32;
+    let mut total_wasted = 0usize;
+    let mut entries_per_page: Vec<usize> = Vec::new();
+
+    for new_vid in 0..n {
+        let old_vid = new_to_old[new_vid] as usize;
+        let degree = degrees[old_vid] as usize;
+        let record_bytes = degree * 4; // neighbor VIDs
+        let entry_cost = DIR_ENTRY + record_bytes;
+
+        // Check if this entry fits on current page
+        if page_used + entry_cost > page_size && entries_on_page > 0 {
+            // Close current page
+            total_wasted += page_size - page_used;
+            entries_per_page.push(entries_on_page);
+            total_pages += 1;
+            page_id += 1;
+            page_used = PAGE_HEADER;
+            entries_on_page = 0;
+        }
+
+        vid_to_page[old_vid] = page_id;
+        page_used += entry_cost;
+        entries_on_page += 1;
+    }
+
+    // Close last page
+    if entries_on_page > 0 {
+        total_wasted += page_size - page_used;
+        entries_per_page.push(entries_on_page);
+        total_pages += 1;
+    }
+
+    entries_per_page.sort();
+    let stats = PackingStats {
+        total_pages,
+        avg_entries: n as f64 / total_pages as f64,
+        min_entries: *entries_per_page.first().unwrap_or(&0),
+        p50_entries: entries_per_page[entries_per_page.len() / 2],
+        max_entries: *entries_per_page.last().unwrap_or(&0),
+        avg_utilization: 1.0 - total_wasted as f64 / (total_pages as usize * page_size) as f64,
+    };
+
+    (vid_to_page, stats)
+}
+
+struct PackingStats {
+    total_pages: u32,
+    avg_entries: f64,
+    min_entries: usize,
+    p50_entries: usize,
+    max_entries: usize,
+    avg_utilization: f64,  // fraction of page bytes used
+}
+
+#[test]
+#[ignore] // Needs COHERE_DIR
+fn exp_page_trace() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+
+    eprintln!("=== EXP-PAGE-TRACE: Cohere {}K, dim={}, k={} ===", n / 1000, dim, k);
+
+    // 1. Build NSW index
+    eprintln!("Building NSW index (n={}, m_max={}, ef_c={}) ...", n, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let entry_set = index.entry_set().to_vec();
+
+    // 2. Degree distribution
+    let degrees: Vec<u16> = (0..n).map(|v| index.neighbors(v as u32).len() as u16).collect();
+    {
+        let mut sorted_deg: Vec<u16> = degrees.clone();
+        sorted_deg.sort();
+        let avg_deg = degrees.iter().map(|&d| d as f64).sum::<f64>() / n as f64;
+        eprintln!("Degree distribution (n={}): min={} p25={} p50={} mean={:.1} p75={} max={}",
+            n, sorted_deg[0], sorted_deg[n/4], sorted_deg[n/2], avg_deg,
+            sorted_deg[3*n/4], sorted_deg[n-1]);
+        // Per-node record size: dir_entry(8B) + degree*4B
+        let avg_record = 8.0 + avg_deg * 4.0;
+        let max_record = 8 + sorted_deg[n-1] as usize * 4;
+        eprintln!("  avg record: {:.0}B, max record: {}B (fits 4KB: {})",
+            avg_record, max_record, max_record <= 4096 - 4);
+    }
+
+    // 3. Compute reorder mappings
+    eprintln!("Computing BFS reorder ...");
+    let identity: Vec<u32> = (0..n as u32).collect();
+    let bfs_map = bfs_reorder(n, &entry_set, |vid| index.neighbors(vid));
+    eprintln!("  BFS reorder done");
+
+    // 4. Collect traces
+    let num_queries = nq.min(100);
+    let query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(num_queries).map(|c| c.to_vec()).collect();
+
+    let ef = 200;
+    eprintln!("Running traced beam search (nq={}, ef={}) ...", num_queries, ef);
+
+    let mut traces: Vec<Vec<u32>> = Vec::with_capacity(num_queries);
+    let mut recalls: Vec<f64> = Vec::with_capacity(num_queries);
+
+    for i in 0..num_queries {
+        let (results, trace) = traced_beam_search(&query_vecs[i], &entry_set, k, ef, &index);
+        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+        recalls.push(recall_at_k(&ids, &ground_truth[i]));
+        traces.push(trace);
+    }
+
+    let mean_recall = recalls.iter().sum::<f64>() / num_queries as f64;
+    let avg_trace_len = traces.iter().map(|t| t.len()).sum::<usize>() as f64 / num_queries as f64;
+    eprintln!("  recall={:.3}, avg_expansions={:.1}", mean_recall, avg_trace_len);
+
+    // 5. Byte-accurate page packing simulation
+    let page_size = 4096usize;
+    let reorders: Vec<(&str, &[u32])> = vec![
+        ("sequential", &identity),
+        ("bfs", &bfs_map),
+    ];
+
+    eprintln!("\n--- Byte-accurate page packing (page_size={}B) ---", page_size);
+    eprintln!("  Page layout: header(4B) + directory(8B/entry) + records(degree*4B/entry)");
+    eprintln!(
+        "\n{:>12} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>6}",
+        "reorder", "pages", "n/pg", "min", "p50", "max", "util%",
+        "pg/q", "p50_pg", "p99_pg", "ratio"
+    );
+
+    for (name, reorder) in &reorders {
+        let (vid_to_page, stats) = byte_pack_pages(n, reorder, &degrees, page_size);
+
+        let mut page_reads: Vec<usize> = traces.iter()
+            .map(|t| simulate_page_reads_mapped(t, &vid_to_page))
+            .collect();
+        let avg_pg = page_reads.iter().sum::<usize>() as f64 / num_queries as f64;
+
+        page_reads.sort();
+        let p50 = page_reads[page_reads.len() / 2];
+        let p99_idx = (page_reads.len() as f64 * 0.99).ceil() as usize - 1;
+        let p99 = page_reads[p99_idx.min(page_reads.len() - 1)];
+
+        let ratio = avg_pg / avg_trace_len;
+
+        eprintln!(
+            "{:>12} {:>8} {:>6.1} {:>6} {:>6} {:>6} {:>6.1} {:>8.1} {:>8} {:>8} {:>6.3}",
+            name, stats.total_pages, stats.avg_entries,
+            stats.min_entries, stats.p50_entries, stats.max_entries,
+            stats.avg_utilization * 100.0,
+            avg_pg, p50, p99, ratio
+        );
+    }
+
+    // 6. Neighbor co-expansion analysis
+    eprintln!("\n--- Neighbor co-expansion analysis ---");
+    let mut total_neighbors_expanded = 0u64;
+    let mut total_neighbors = 0u64;
+    for trace in &traces {
+        let expanded_set: std::collections::HashSet<u32> = trace.iter().copied().collect();
+        for &vid in trace.iter() {
+            for &nbr in index.neighbors(vid) {
+                total_neighbors += 1;
+                if expanded_set.contains(&nbr) {
+                    total_neighbors_expanded += 1;
+                }
+            }
+        }
+    }
+    eprintln!("  neighbors also expanded: {}/{} ({:.1}%)",
+        total_neighbors_expanded, total_neighbors,
+        total_neighbors_expanded as f64 / total_neighbors as f64 * 100.0);
+
+    // 7. Working set analysis
+    eprintln!("\n--- Working set (unique pages across all {} queries) ---", num_queries);
+    for (name, reorder) in &[("sequential", &identity as &[u32]), ("bfs", &bfs_map as &[u32])] {
+        let (vid_to_page, stats) = byte_pack_pages(n, reorder, &degrees, page_size);
+        let mut all_pages = std::collections::HashSet::new();
+        for trace in &traces {
+            for &vid in trace {
+                all_pages.insert(vid_to_page[vid as usize]);
+            }
+        }
+        eprintln!("  {}: {}/{} pages touched ({:.1}%)",
+            name, all_pages.len(), stats.total_pages,
+            all_pages.len() as f64 / stats.total_pages as f64 * 100.0);
+    }
+
+    // 8. Page access frequency analysis (hot page / hub pinning value)
+    eprintln!("\n--- Page access frequency (BFS reorder) ---");
+    {
+        let (vid_to_page, stats) = byte_pack_pages(n, &bfs_map, &degrees, page_size);
+        let mut page_freq: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut total_accesses = 0u64;
+        for trace in &traces {
+            for &vid in trace {
+                *page_freq.entry(vid_to_page[vid as usize]).or_insert(0) += 1;
+                total_accesses += 1;
+            }
+        }
+        let mut freq_vec: Vec<u64> = page_freq.values().copied().collect();
+        freq_vec.sort_unstable_by(|a, b| b.cmp(a)); // descending
+
+        eprintln!("  total page accesses: {} across {} unique pages", total_accesses, freq_vec.len());
+        for &top_n in &[1, 5, 10, 20, 50, 100] {
+            if top_n > freq_vec.len() { break; }
+            let cum: u64 = freq_vec[..top_n].iter().sum();
+            eprintln!("  top-{:>3} pages: {:>6} accesses ({:>5.1}% of total), hottest={}/q",
+                top_n, cum, cum as f64 / total_accesses as f64 * 100.0,
+                if top_n == 1 { format!("{:.1}", freq_vec[0] as f64 / num_queries as f64) } else { "-".to_string() });
+        }
+        // Per-query: how many pages are accessed >1 time within a single query (intra-query reuse)?
+        let mut intra_reuse_total = 0u64;
+        let mut intra_reuse_queries = 0u64;
+        for trace in &traces {
+            let mut page_count: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &vid in trace {
+                *page_count.entry(vid_to_page[vid as usize]).or_insert(0) += 1;
+            }
+            let reused = page_count.values().filter(|&&c| c > 1).count();
+            if reused > 0 { intra_reuse_queries += 1; }
+            intra_reuse_total += reused as u64;
+        }
+        eprintln!("  intra-query page reuse: {:.1} pages/q reused >1 time ({}/{} queries have reuse)",
+            intra_reuse_total as f64 / num_queries as f64,
+            intra_reuse_queries, num_queries);
+    }
+
+    // 9. adj_index overhead
+    let adj_index_bytes = n * 8; // vid -> (page_id: u32, offset: u16, degree: u16)
+    eprintln!("\n--- adj_index overhead ---");
+    eprintln!("  {} entries × 8B = {:.1} MB (DRAM-resident)",
+        n, adj_index_bytes as f64 / 1024.0 / 1024.0);
+}

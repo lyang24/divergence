@@ -21,6 +21,7 @@ use divergence_storage::BLOCK_SIZE;
 use crate::io::IoDriver;
 
 const SET_WAYS: u32 = 8;
+const MAX_PINNED_PER_SET: u32 = 4; // hub-pinned entries per set (leaves ≥4 ways for eviction)
 const MAX_PREFETCH_QUEUE: usize = 16;
 
 /// Max concurrent waiters per LOADING entry.
@@ -95,6 +96,7 @@ struct PrefetchChannel {
     len: usize,
     waker: Option<Waker>,
     stopped: bool,
+    paused: bool, // when true, prefetch_hint() silently drops new hints
 }
 
 impl PrefetchChannel {
@@ -106,6 +108,7 @@ impl PrefetchChannel {
             len: 0,
             waker: None,
             stopped: false,
+            paused: false,
         }
     }
 
@@ -142,6 +145,11 @@ impl PrefetchChannel {
         self.head = (self.head + 1) % MAX_PREFETCH_QUEUE;
         self.len -= 1;
         entry
+    }
+
+    /// Discard all pending entries.
+    fn drain(&mut self) {
+        while self.pop().is_some() {}
     }
 }
 
@@ -184,6 +192,7 @@ struct Entry {
     referenced: bool,  // clock second-chance bit
     prefetched: bool,  // true if loaded via prefetch_hint (for consumed tracking)
     pin_count: u32,    // live CacheGuards
+    pinned: bool,      // hub-pinned: eviction skips this entry
     waiters: WaiterArray,  // fixed-capacity, zero-alloc
 }
 
@@ -196,6 +205,7 @@ impl Entry {
             referenced: false,
             prefetched: false,
             pin_count: 0,
+            pinned: false,
             waiters: WaiterArray::new(),
         }
     }
@@ -206,6 +216,7 @@ impl Entry {
         self.referenced = false;
         self.prefetched = false;
         self.pin_count = 0;
+        self.pinned = false;
         // load_gen is NOT reset — monotonically increasing
         // waiters are NOT cleared here — find_or_evict caller handles it
     }
@@ -278,6 +289,10 @@ pub struct CacheStatsSnapshot {
     pub evict_fail_all_pinned: u64,
     pub bypasses: u64,
     pub prefetch_hits: u64,
+    /// Physical IO reads completed (miss loads + prefetch loads + bypass reads).
+    /// This is the true NVMe IO count, unlike misses which undercounts
+    /// because prefetch reads show up as later hits.
+    pub phys_reads: u64,
 }
 
 struct CacheStats {
@@ -288,6 +303,7 @@ struct CacheStats {
     evict_fail_all_pinned: Cell<u64>,
     bypasses: Cell<u64>,
     prefetch_hits: Cell<u64>,
+    phys_reads: Cell<u64>,
 }
 
 impl CacheStats {
@@ -300,6 +316,7 @@ impl CacheStats {
             evict_fail_all_pinned: Cell::new(0),
             bypasses: Cell::new(0),
             prefetch_hits: Cell::new(0),
+            phys_reads: Cell::new(0),
         }
     }
 
@@ -325,6 +342,9 @@ impl CacheStats {
     fn inc_prefetch_hits(&self) {
         self.prefetch_hits.set(self.prefetch_hits.get() + 1);
     }
+    fn inc_phys_reads(&self) {
+        self.phys_reads.set(self.phys_reads.get() + 1);
+    }
 
     fn snapshot(&self) -> CacheStatsSnapshot {
         CacheStatsSnapshot {
@@ -335,6 +355,7 @@ impl CacheStats {
             evict_fail_all_pinned: self.evict_fail_all_pinned.get(),
             bypasses: self.bypasses.get(),
             prefetch_hits: self.prefetch_hits.get(),
+            phys_reads: self.phys_reads.get(),
         }
     }
 }
@@ -493,8 +514,8 @@ impl AdjacencyPool {
             if entry.state == SlotState::Loading {
                 continue;
             }
-            // Skip pinned (Seastar rule)
-            if entry.pin_count > 0 {
+            // Skip pinned (Seastar rule) or hub-pinned
+            if entry.pin_count > 0 || entry.pinned {
                 continue;
             }
             // Second chance
@@ -532,6 +553,100 @@ impl AdjacencyPool {
     /// Get a snapshot of cache statistics.
     pub fn stats(&self) -> CacheStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Reset all entries to EMPTY. Used for cold_per_query benchmarks.
+    ///
+    /// Panics if any entry is pinned (CacheGuard held) or in LOADING state.
+    /// Caller must ensure no in-flight IO or held guards.
+    /// Reset all non-pinned entries to EMPTY. Used for per-query cold benchmarks.
+    ///
+    /// **Caller must ensure no in-flight IO**: stop the prefetch worker and
+    /// await its JoinHandle before calling this. Panics if any non-pinned entry
+    /// is in LOADING state or has a held CacheGuard (pin_count > 0).
+    pub fn clear(&self) {
+        let mut state = self.state.borrow_mut();
+        for entry in state.entries.iter_mut() {
+            // Hub-pinned entries survive clear
+            if entry.pinned {
+                continue;
+            }
+            assert!(
+                entry.state != SlotState::Loading,
+                "clear() called with LOADING entry (vid={}). \
+                 Stop prefetch worker and await its JoinHandle before calling clear().",
+                entry.vid
+            );
+            assert!(
+                entry.pin_count == 0,
+                "clear() called with pinned entry (vid={}, pin_count={})",
+                entry.vid, entry.pin_count
+            );
+            entry.waiters.wake_all();
+            entry.reset();
+        }
+        // Drain any pending prefetch hints
+        state.prefetch.drain();
+    }
+
+    /// Pre-load and pin pages as non-evictable hub pages.
+    ///
+    /// Each page is loaded via `get_or_load`, then marked `pinned = true`.
+    /// Set-aware constraint: at most `MAX_PINNED_PER_SET` (4) entries per set
+    /// can be pinned — excess pages in a crowded set are silently skipped.
+    /// Returns the number of pages actually pinned.
+    pub async fn pin_pages(&self, page_ids: &[u32], io: &IoDriver) -> io::Result<u32> {
+        // Dedup page_ids to avoid wasted IO and double-counting
+        let mut seen = std::collections::HashSet::with_capacity(page_ids.len());
+        let mut pinned_count = 0u32;
+
+        for &page_id in page_ids {
+            if !seen.insert(page_id) {
+                continue; // duplicate
+            }
+
+            // Check set saturation and already-pinned BEFORE issuing IO
+            {
+                let set_idx = self.set_index(page_id);
+                let base = self.set_base(set_idx);
+                let state = self.state.borrow();
+                let mut set_pinned = 0u32;
+                let mut already_pinned = false;
+                for way in 0..SET_WAYS {
+                    let entry = &state.entries[(base + way) as usize];
+                    if entry.pinned {
+                        set_pinned += 1;
+                    }
+                    if entry.vid == page_id && entry.pinned {
+                        already_pinned = true;
+                        break;
+                    }
+                }
+                if already_pinned || set_pinned >= MAX_PINNED_PER_SET {
+                    continue; // already pinned or set saturated — no IO
+                }
+            }
+
+            // Load the page into cache
+            let guard = self.get_or_load(page_id, io).await?;
+            drop(guard); // release CacheGuard pin_count
+
+            // Mark the entry as hub-pinned
+            let set_idx = self.set_index(page_id);
+            let base = self.set_base(set_idx);
+            let mut state = self.state.borrow_mut();
+            for way in 0..SET_WAYS {
+                let idx = (base + way) as usize;
+                if state.entries[idx].vid == page_id
+                    && state.entries[idx].state == SlotState::Ready
+                {
+                    state.entries[idx].pinned = true;
+                    pinned_count += 1;
+                    break;
+                }
+            }
+        }
+        Ok(pinned_count)
     }
 
     /// Total number of slots in the pool.
@@ -628,6 +743,7 @@ impl AdjacencyPool {
             None => {
                 // All ways pinned/loading — bypass cache with direct read
                 self.stats.inc_bypasses();
+                self.stats.inc_phys_reads();
                 let buf = io.read_adj_block(vid).await?;
                 return Ok(CacheGuard {
                     pool: self,
@@ -661,6 +777,7 @@ impl AdjacencyPool {
         // Read directly into slot buffer (no memcpy, no flight pool)
         let slot_ptr = self.slot_store.slot_ptr(slot_idx);
         io.read_adj_block_direct(vid, slot_ptr).await?;
+        self.stats.inc_phys_reads();
 
         // IO succeeded — disarm guard, transition to READY
         load_guard.disarm();
@@ -693,6 +810,11 @@ impl AdjacencyPool {
         let set_idx = self.set_index(vid);
         let base = self.set_base(set_idx);
         let mut state = self.state.borrow_mut();
+
+        // Paused: silently drop new hints (quiesce for per-query clear)
+        if state.prefetch.paused {
+            return;
+        }
 
         // Check if vid is already present (READY or LOADING)
         for way in 0..SET_WAYS {
@@ -747,6 +869,40 @@ impl AdjacencyPool {
             }
         }
         false
+    }
+
+    /// Returns true if any entry is in LOADING state.
+    pub fn has_loading(&self) -> bool {
+        let state = self.state.borrow();
+        state.entries.iter().any(|e| e.state == SlotState::Loading)
+    }
+
+    /// Pause/unpause prefetch hint acceptance.
+    /// When paused, `prefetch_hint()` silently drops new hints.
+    /// The worker stays alive but idles (no new work enters the channel).
+    pub fn pause_prefetch(&self, paused: bool) {
+        let mut state = self.state.borrow_mut();
+        state.prefetch.paused = paused;
+    }
+
+    /// Drain pending prefetch hints without stopping the worker.
+    /// The worker stays alive but idles (empty channel).
+    ///
+    /// IMPORTANT: Drained entries may correspond to slots already set to LOADING.
+    /// Since the prefetch task will never be spawned for these, we must reset
+    /// the orphaned LOADING slots to prevent `has_loading()` from spinning forever.
+    pub fn drain_prefetch(&self) {
+        let mut state = self.state.borrow_mut();
+        while let Some(pe) = state.prefetch.pop() {
+            let entry = &mut state.entries[pe.slot_idx as usize];
+            // Only reset if this is still the same LOADING entry we queued
+            if entry.vid == pe.vid && entry.load_gen == pe.load_gen
+                && entry.state == SlotState::Loading
+            {
+                entry.waiters.wake_all();
+                entry.reset();
+            }
+        }
     }
 
     /// Signal the prefetch worker to stop. Wake it if it's sleeping.
@@ -832,6 +988,7 @@ async fn prefetch_one_read(
     let slot_ptr = pool.slot_store.slot_ptr(pe.slot_idx);
     match io.read_adj_block_direct(pe.vid, slot_ptr).await {
         Ok(()) => {
+            pool.stats.inc_phys_reads();
             let mut state = pool.state.borrow_mut();
             let entry = &mut state.entries[pe.slot_idx as usize];
             if entry.vid == pe.vid && entry.load_gen == pe.load_gen
@@ -1185,6 +1342,59 @@ mod tests {
         assert!(slot.is_some());
         let evicted_idx = slot.unwrap();
         assert_eq!(evicted_idx, 7); // way 7 is the only unpinned
+    }
+
+    #[test]
+    fn find_or_evict_skips_hub_pinned() {
+        let pool = make_pool(1);
+        // Fill all 8 slots: 7 hub-pinned (pinned=true), 1 unpinned
+        {
+            let mut state = pool.state.borrow_mut();
+            for way in 0..SET_WAYS {
+                let entry = &mut state.entries[way as usize];
+                entry.vid = way;
+                entry.state = SlotState::Ready;
+                entry.referenced = false;
+                entry.pin_count = 0;
+                entry.pinned = way < 7;
+            }
+        }
+
+        // Should evict the non-hub-pinned one (way 7)
+        let slot = pool.find_or_evict(100);
+        assert!(slot.is_some());
+        let evicted_idx = slot.unwrap();
+        assert_eq!(evicted_idx, 7);
+    }
+
+    #[test]
+    fn clear_preserves_hub_pinned() {
+        let pool = make_pool(1);
+        // Place 2 hub-pinned entries and 6 normal entries
+        {
+            let mut state = pool.state.borrow_mut();
+            for way in 0..SET_WAYS {
+                let entry = &mut state.entries[way as usize];
+                entry.vid = way;
+                entry.state = SlotState::Ready;
+                entry.referenced = true;
+                entry.pinned = way < 2;
+            }
+        }
+
+        pool.clear();
+
+        // Hub-pinned entries should survive
+        let state = pool.state.borrow();
+        for way in 0..SET_WAYS {
+            let entry = &state.entries[way as usize];
+            if way < 2 {
+                assert_eq!(entry.vid, way, "hub-pinned entry should survive clear");
+                assert!(entry.pinned);
+            } else {
+                assert_eq!(entry.state, SlotState::Empty, "non-pinned entry should be cleared");
+            }
+        }
     }
 
     #[test]

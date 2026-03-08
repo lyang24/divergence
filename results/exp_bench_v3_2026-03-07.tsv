@@ -1,0 +1,36 @@
+=== EXP-BENCH v3: Page-Packed Adjacency (BFS Reorder) ===
+Cohere 100K, dim=768, k=100, ef=200, W=4, nq=100, warmup=10
+v3: 1537 pages, adj_index=781KB DRAM, pool_cold=256 pages (1MB)
+
+--- v1 baseline (1 block per VID, adjacency.dat) ---
+label          ef    k  W   S   D  c%  recall   p50ms   p99ms     qps   exp   use   wst  blk/q  mis/q  hit/q  sf/q  pf_i  pf_c  best@  1stk@  early%  waste%  hit%   io_ms  cmp_ms  dst_ms ms/mis
+warm          200  100  4   0   0   5   0.963     8.9    11.5   118.7   201    92   109  201.1   24.3  176.8  65.4 127.5 122.6   13.3    1.3     0.0    54.1  87.9    6.03    2.20    1.96  0.248
+warm-S4D16    200  100  4   4  16   5   0.960     9.4    13.6   112.1   184    91    93  183.8   23.6  160.2  55.9 115.7 110.7   11.7    1.3    52.0    50.6  87.2    6.72    2.02    1.81  0.285
+cold          200  100  4   0   0   0   0.963    15.5    18.5    64.9   201    92   109  201.1   77.2  124.8  54.4 222.7 124.8   13.3    1.3     0.0    54.1  62.0   12.90    2.32    2.09  0.167
+cold-S4D16    200  100  4   4  16   0   0.960    15.0    19.0    69.3   184    91    93  183.8   73.7  111.1  46.5 205.7 111.1   11.7    1.3    52.0    50.6  60.4   12.07    2.17    1.95  0.164
+
+--- v3 page-packed adjacency (BFS reorder, adjacency_pages.dat) ---
+label          ef    k  W   S   D  c%  recall   p50ms   p99ms     qps   exp   use   wst  blk/q  mis/q  hit/q  sf/q  pf_i  pf_c  best@  1stk@  early%  waste%  hit%   io_ms  cmp_ms  dst_ms ms/mis
+v3-warm       200  100  4   0   0   5   0.963     7.4     9.8   135.3   201    92   109  201.1   18.9  182.2  40.8  94.8  91.7   13.3    1.3     0.0    54.1  90.6    5.01    2.19    1.98  0.265
+v3-warm-S4D16 200  100  4   4  16   5   0.960     7.4     9.5   142.8   184    91    93  183.8   18.6  165.1  36.5  86.8  83.8   11.7    1.3    52.0    50.6  89.9    4.78    2.04    1.84  0.257
+v3-cold       200  100  4   0   0   0   0.963     7.6     9.9   131.3   201    92   109  201.1   19.1  182.1  39.8  95.7  92.6   13.3    1.3     0.0    54.1  90.5    5.23    2.19    1.98  0.274
+v3-cold-S4D16 200  100  4   4  16   0   0.960     7.1     9.8   142.1   184    91    93  183.8   19.0  164.8  36.1  88.1  84.9   11.7    1.3    52.0    50.6  89.7    4.92    1.94    1.75  0.260
+
+--- Summary: v1 vs v3 ---
+metric          v1-warm  v3-warm  delta    v1-cold  v3-cold  delta
+mis/q             24.3     18.9   -22%       77.2     19.1   -75%
+hit%              87.9     90.6   +2.7       62.0     90.5   +28.5
+p50ms              8.9      7.4   -17%       15.5      7.6   -51%
+p99ms             11.5      9.8   -15%       18.5      9.9   -46%
+qps              118.7    135.3   +14%       64.9    131.3   +102%
+recall            0.963    0.963   0.0       0.963    0.963   0.0
+
+Key findings:
+1. v3-cold (no warmup) beats v1-warm (5% cache): 7.6ms vs 8.9ms p50
+2. Cold path is where v3 dominates: 75% mis/q reduction, 51% p50 reduction
+3. Hit rate jumps from 62% to 90.5% cold — BFS locality packs co-accessed VIDs into same page
+4. Recall unchanged (same graph, same algorithm)
+5. v3-cold-S4D16 is best config: 7.1ms p50, 9.8ms p99, 142 QPS
+6. Stopping + v3 synergy confirmed: S4D16 saves 8% blk/q on top of page packing
+7. Simulation predicted 33% page/q reduction; actual mis/q reduction is 75% cold
+   because cache amplifies page reuse (one cached page serves multiple VIDs)

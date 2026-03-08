@@ -16,6 +16,34 @@ pub struct IndexMeta {
     pub ef_construction: usize,
     pub adj_block_size: usize,
     pub entry_set: Vec<u32>,
+    /// Adjacency block layout version: 1 = IDs only, 2 = IDs + inline PQ codes.
+    #[serde(default = "default_adj_layout_version")]
+    pub adj_layout_version: u32,
+    /// PQ configuration (present only when adj_layout_version >= 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq: Option<PqMeta>,
+    /// Number of pages in adjacency_pages.dat (v3 only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_pages: Option<u32>,
+}
+
+fn default_adj_layout_version() -> u32 {
+    1
+}
+
+/// PQ codebook metadata stored in meta.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PqMeta {
+    /// Number of subquantizers (M). dim must be divisible by M.
+    pub num_subquantizers: usize,
+    /// Number of centroids per subspace (always 256 for PQ×8).
+    pub num_centroids: usize,
+    /// Dimension of each subspace (= dimension / num_subquantizers).
+    pub subspace_dim: usize,
+    /// Distance metric used for PQ training ("l2" or "ip").
+    pub metric: String,
+    /// Filename of the codebook file (relative to index directory).
+    pub codebook_file: String,
 }
 
 impl IndexMeta {

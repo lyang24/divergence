@@ -45,6 +45,9 @@ pub struct SearchPerfContext {
     pub blocks_hit: u64,
     /// Cache misses (required NVMe IO or bypass).
     pub blocks_miss: u64,
+    /// Physical NVMe reads (miss loads + prefetch loads + bypass reads).
+    /// Unlike blocks_miss, this counts prefetch IO that later becomes a hit.
+    pub phys_reads: u64,
     /// Single-flight waits (found LOADING, awaited existing IO).
     pub singleflight_waits: u64,
     /// Candidates expanded (while loop iterations).
@@ -93,6 +96,14 @@ pub struct SearchPerfContext {
     pub consecutive_stalls_at_end: u64,
     /// Expansion count at which search stopped (0 if not stopped early).
     pub expansions_at_stop: u64,
+
+    // --- PQ gating diagnostics (always on) ---
+    /// Total neighbors scored with PQ approximate distance.
+    pub pq_candidates_scored: u64,
+    /// Neighbors that passed the PQ gate (went to exact scoring).
+    pub pq_candidates_passed: u64,
+    /// Neighbors filtered out by PQ gate (skipped exact scoring).
+    pub pq_candidates_filtered: u64,
 
     // --- Timers (PerfLevel::EnableTime) ---
     /// Wall-clock nanoseconds spent awaiting adjacency block loads.
@@ -754,6 +765,7 @@ mod tests {
             blocks_read: 50,
             blocks_hit: 30,
             blocks_miss: 18,
+            phys_reads: 20,
             singleflight_waits: 2,
             expansions: 50,
             distance_computes: 500,
@@ -773,6 +785,9 @@ mod tests {
             stopped_early: false,
             consecutive_stalls_at_end: 0,
             expansions_at_stop: 0,
+            pq_candidates_scored: 0,
+            pq_candidates_passed: 0,
+            pq_candidates_filtered: 0,
             io_wait_ns: 200_000,
             compute_ns: 300_000,
             dist_ns: 250_000,

@@ -1,0 +1,28 @@
+=== EXP-PAGE-TRACE: Cohere 100K, dim=768, k=100, ef=200 ===
+recall=0.963, avg_expansions=201.1
+
+Page packing simulation (cold, no cache)
+reorder	n/pg	pages/q	p50_pg	p99_pg	max_pg	ratio
+sequential	4	200.5	200	207	207	0.997
+sequential	8	199.8	200	205	206	0.993
+sequential	16	198.3	198	204	206	0.986
+sequential	24	196.6	197	203	205	0.978
+sequential	32	195.3	195	201	203	0.971
+sequential	48	192.3	192	199	203	0.956
+sequential	64	189.2	190	197	200	0.941
+bfs	4	184.2	184	195	200	0.916
+bfs	8	172.4	172	188	193	0.857
+bfs	16	158.4	159	180	186	0.788
+bfs	24	150.3	150	174	180	0.747
+bfs	32	143.3	142	169	179	0.713
+bfs	48	134.0	133	165	169	0.666
+bfs	64	127.2	127	157	165	0.633
+
+Neighbor co-expansion: 87079/497817 (17.5%)
+
+Working set (unique pages across all 100 queries)
+reorder	n/pg	total_pg	touched	touch%
+sequential	16	6250	5609	89.7%
+sequential	32	3125	3102	99.3%
+bfs	16	6250	4476	71.6%
+bfs	32	3125	2662	85.2%

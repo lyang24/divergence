@@ -7,7 +7,7 @@
 //! NswIndex: immutable reader with flattened graph + hub entry set.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -169,6 +169,10 @@ pub struct NswBuilder {
     // Global state: entry point for incremental construction
     entry_point: Mutex<Option<VectorId>>,
 
+    /// Bitset: one bit per VID. Atomic for lock-free concurrent insert-once check.
+    /// Uses AtomicU64 for fewer atomic objects and better cacheline alignment.
+    inserted: Vec<AtomicU64>,
+
     // Thread-local resources
     visited_pool: VisitedPool,
 }
@@ -190,6 +194,7 @@ impl NswBuilder {
             locks: (0..capacity).map(|_| RwLock::new(())).collect(),
             slot_layout,
             entry_point: Mutex::new(None),
+            inserted: (0..((capacity + 63) / 64)).map(|_| AtomicU64::new(0)).collect(),
             visited_pool: VisitedPool::new(capacity),
         }
     }
@@ -207,6 +212,16 @@ impl NswBuilder {
             "VID {} out of bounds (capacity={})",
             vid,
             self.capacity
+        );
+
+        // Insert-once contract: duplicate VID = data race on SyncF32Vec (UB).
+        let word_idx = vid as usize / 64;
+        let bit_mask = 1u64 << (vid as usize % 64);
+        let prev = self.inserted[word_idx].fetch_or(bit_mask, Ordering::AcqRel);
+        assert!(
+            prev & bit_mask == 0,
+            "VID {} inserted twice — build-once immutable index requires each VID inserted exactly once",
+            vid
         );
 
         // Store vector (write-once per VID, disjoint regions)
@@ -412,6 +427,18 @@ impl NswBuilder {
             "expected {} vectors but only {} were inserted (dense IDs 0..N-1 required)",
             self.capacity, num_inserted
         );
+
+        // Defense-in-depth (debug only): verify every VID 0..capacity-1 was inserted.
+        #[cfg(debug_assertions)]
+        for vid in 0..self.capacity {
+            let word_idx = vid / 64;
+            let bit_mask = 1u64 << (vid % 64);
+            debug_assert!(
+                self.inserted[word_idx].load(Ordering::Relaxed) & bit_mask != 0,
+                "VID {} was never inserted (dense IDs 0..{} required for build-once immutable index)",
+                vid, self.capacity - 1
+            );
+        }
 
         // Extract inner data from UnsafeCells (self is consumed, no more aliases)
         let vectors = self.vectors.0.into_inner();
@@ -821,6 +848,39 @@ mod tests {
                 vid
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Insert-once contract tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "inserted twice")]
+    fn duplicate_insert_panics() {
+        let n = 100;
+        let dim = 32;
+        let vectors = generate_vectors(n, dim, 42);
+        let config = NswConfig::new(16, 50);
+        let builder = NswBuilder::new(config, dim, MetricType::L2, n);
+        for i in 0..n {
+            builder.insert(VectorId(i as u32), &vectors[i]);
+        }
+        builder.insert(VectorId(0), &vectors[0]); // must panic
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 100 vectors but only 99")]
+    fn build_catches_incomplete_insert() {
+        let n = 100;
+        let dim = 32;
+        let vectors = generate_vectors(n, dim, 42);
+        let config = NswConfig::new(16, 50);
+        let builder = NswBuilder::new(config, dim, MetricType::L2, n);
+        for i in 0..n {
+            if i == 50 { continue; }
+            builder.insert(VectorId(i as u32), &vectors[i]);
+        }
+        builder.build(); // panics: 99 != 100
     }
 
 }

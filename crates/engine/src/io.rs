@@ -253,6 +253,27 @@ impl IoDriver {
         Self::open_with_budget(index_dir, dimension, adj_inflight, direct_io, None).await
     }
 
+    /// Open v3 page-packed adjacency file (adjacency_pages.dat) for async reading.
+    ///
+    /// This is a convenience wrapper so v3 experiments can reuse the existing
+    /// 4KB-block cache and IO budget plumbing unchanged.
+    pub async fn open_pages(
+        index_dir: &str,
+        dimension: usize,
+        adj_inflight: usize,
+        direct_io: bool,
+    ) -> io::Result<Self> {
+        Self::open_with_budget_file(
+            index_dir,
+            dimension,
+            adj_inflight,
+            direct_io,
+            None,
+            "adjacency_pages.dat",
+        )
+        .await
+    }
+
     /// Open with explicit global IO budget.
     pub async fn open_with_budget(
         index_dir: &str,
@@ -261,7 +282,26 @@ impl IoDriver {
         direct_io: bool,
         global_budget: Option<Arc<GlobalIoBudget>>,
     ) -> io::Result<Self> {
-        let adj_path = format!("{}/adjacency.dat", index_dir);
+        Self::open_with_budget_file(
+            index_dir,
+            dimension,
+            adj_inflight,
+            direct_io,
+            global_budget,
+            "adjacency.dat",
+        )
+        .await
+    }
+
+    async fn open_with_budget_file(
+        index_dir: &str,
+        dimension: usize,
+        adj_inflight: usize,
+        direct_io: bool,
+        global_budget: Option<Arc<GlobalIoBudget>>,
+        filename: &str,
+    ) -> io::Result<Self> {
+        let path = format!("{}/{}", index_dir, filename);
 
         let mut opts = monoio::fs::OpenOptions::new();
         opts.read(true);
@@ -269,7 +309,7 @@ impl IoDriver {
             opts.custom_flags(libc::O_DIRECT);
         }
 
-        let adj_file = opts.open(&adj_path).await?;
+        let adj_file = opts.open(&path).await?;
 
         Ok(Self {
             adj_file,
@@ -296,7 +336,49 @@ impl IoDriver {
         global_budget: Arc<GlobalIoBudget>,
         health: Arc<AtomicU8>,
     ) -> io::Result<Self> {
-        let adj_path = format!("{}/adjacency.dat", index_dir);
+        Self::open_production_file(
+            index_dir,
+            dimension,
+            adj_inflight,
+            direct_io,
+            global_budget,
+            health,
+            "adjacency.dat",
+        )
+        .await
+    }
+
+    /// Production-mode open for v3 page-packed adjacency file (adjacency_pages.dat).
+    pub async fn open_pages_production(
+        index_dir: &str,
+        dimension: usize,
+        adj_inflight: usize,
+        direct_io: bool,
+        global_budget: Arc<GlobalIoBudget>,
+        health: Arc<AtomicU8>,
+    ) -> io::Result<Self> {
+        Self::open_production_file(
+            index_dir,
+            dimension,
+            adj_inflight,
+            direct_io,
+            global_budget,
+            health,
+            "adjacency_pages.dat",
+        )
+        .await
+    }
+
+    async fn open_production_file(
+        index_dir: &str,
+        dimension: usize,
+        adj_inflight: usize,
+        direct_io: bool,
+        global_budget: Arc<GlobalIoBudget>,
+        health: Arc<AtomicU8>,
+        filename: &str,
+    ) -> io::Result<Self> {
+        let path = format!("{}/{}", index_dir, filename);
 
         let mut opts = monoio::fs::OpenOptions::new();
         opts.read(true);
@@ -304,7 +386,7 @@ impl IoDriver {
             opts.custom_flags(libc::O_DIRECT);
         }
 
-        let adj_file = opts.open(&adj_path).await?;
+        let adj_file = opts.open(&path).await?;
 
         Ok(Self {
             adj_file,

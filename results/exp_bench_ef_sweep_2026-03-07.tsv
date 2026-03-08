@@ -1,0 +1,51 @@
+# BENCH: Cohere 100K, dim=768, GT=brute-force, seed=42, nq=100, warmup=10
+# Instance: i4i (54.177.159.179), NVMe direct_io=true, BENCH_DIR=/mnt/nvme/bench
+# Date: 2026-03-07 (ef sweep: 200/225/250/300 + Ada-ef v0.2, 5-bucket diagnostics)
+# Index: NSW m_max=32, ef_c=200, cosine, entry_set=64
+#
+# PURPOSE: Determine if >=8 bucket (24q, recall=0.929@ef=200) is budget-starved or structural.
+#
+# DEFINITIVE ANSWER: >=8 IS budget-starved. ef CAN rescue it.
+#
+# >=8 bucket recall vs ef (warm):
+#   ef=200: 0.929
+#   ef=225: 0.939 (+0.010)
+#   ef=250: 0.946 (+0.017)
+#   ef=300: 0.957 (+0.028)
+#
+# <8 bucket recall vs ef (warm):
+#   ef=200: 0.942
+#   ef=225: 0.949 (+0.007)
+#   ef=250: 0.954 (+0.012)
+#   ef=300: 0.967 (+0.025)
+#
+# Easy buckets (>=12) are already near-saturated:
+#   ef=200: ~0.979 → ef=300: ~0.990 (diminishing returns)
+#
+# OVERALL recall vs ef (warm):
+#   ef=200: 0.963   blk/q=201   p50=8.2ms   p99=10.6ms   qps=129
+#   ef=225: 0.968   blk/q=226   p50=9.2ms   p99=11.5ms   qps=116
+#   ef=250: 0.973   blk/q=251   p50=10.2ms  p99=12.4ms   qps=103
+#   ef=300: 0.979   blk/q=301   p50=12.0ms  p99=15.3ms   qps=87
+#
+# Ada-ef v0.2 (warm): recall=0.961  blk/q=190  p50=7.6ms  p99=12.5ms  qps=134
+#   Saves 11 blk/q vs ef=200 baseline, but p99 worse due to <8 at ef=250
+#
+# IMPLICATIONS:
+# 1. >=8 queries ARE budget-starved — ef>200 helps significantly
+# 2. The current Ada-ef table undertreats >=8 (gives ef=200, same as baseline)
+# 3. Optimal Ada-ef should give >=8 at least ef=225-250, not just ef=200
+# 4. Entry point strategy may help too, but ef is the primary lever here
+# 5. waste% increases with ef (54→57%), meaning more expansions add fewer neighbors
+#    → graph connectivity is sparse in hard-query regions, but more exploration helps
+#
+label	ef	k	W	S	D	c%	recall	p50ms	p99ms	qps	exp	use	wst	blk/q	mis/q	hit/q	sf/q	pf_i	pf_c	best@	1stk@	early%	waste%	hit%	io_ms	cmp_ms	dst_ms	ms/mis
+warm	200	100	4	0	0	5	0.963	8.2	10.6	129.1	201	92	109	201.1	24.3	176.8	44.3	127.5	122.6	13.3	1.3	0.0	54.1	87.9	5.64	1.93	1.72	0.232
+warm-S4D16	200	100	4	4	16	5	0.960	8.0	10.8	138.0	184	91	93	183.8	23.6	160.2	38.6	115.7	110.7	11.7	1.3	52.0	50.6	87.2	5.24	1.83	1.63	0.222
+warm-ada	200	100	4	0	0	5	0.961	7.6	12.5	133.9	190	88	102	189.7	23.9	165.8	41.3	121.7	116.8	13.3	1.3	0.0	53.7	87.4	5.42	1.87	1.66	0.227
+warm-ef225	225	100	4	0	0	5	0.968	9.2	11.5	115.6	226	102	124	225.8	25.8	200.0	51.0	143.9	139.3	13.3	1.3	0.0	54.9	88.6	6.23	2.22	1.98	0.241
+warm-ef250	250	100	4	0	0	5	0.973	10.2	12.4	103.4	251	112	139	250.8	27.5	223.3	58.5	160.5	155.8	13.3	1.3	0.0	55.5	89.0	6.87	2.57	2.30	0.250
+warm-ef300	300	100	4	0	0	5	0.979	12.0	15.3	86.8	301	131	170	300.7	31.0	269.8	73.7	194.4	189.8	18.8	1.3	0.0	56.5	89.7	8.15	3.10	2.77	0.263
+cold	200	100	4	0	0	0	0.963	14.8	17.6	68.1	201	92	109	201.1	84.9	116.7	38.6	239.3	116.7	13.3	1.3	0.0	54.1	58.0	12.16	2.33	2.10	0.143
+cold-S4D16	200	100	4	4	16	0	0.960	13.8	16.9	75.2	184	91	93	183.8	79.1	105.2	34.1	220.6	105.2	11.7	1.3	52.0	50.6	57.2	11.15	1.97	1.77	0.141
+cold-ada	200	100	4	0	0	0	0.961	13.3	20.2	73.5	190	88	102	189.7	80.2	110.0	35.5	226.3	110.0	13.3	1.3	0.0	53.7	58.0	11.29	2.11	1.89	0.141
