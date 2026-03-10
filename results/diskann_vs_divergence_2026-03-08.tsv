@@ -1,0 +1,180 @@
+=== DiskANN vs Divergence: Cohere 100K, dim=768, k=100, single-thread ===
+Hardware: EC2 i4i (NVMe SSD)
+Dataset: Cohere 100K, 768d, L2-normalized, cosine metric
+Ground truth: brute-force top-100 (same GT file, SHA256 verified)
+DiskANN: Rust v0.48.0, Vamana disk-index, R=32, L_build=200, quantization_type=FP
+  NOTE: disk-index pipeline generates PQ auxiliary files (pq_compressed.bin 9.2MB,
+  pq_pivots.bin 776KB) loaded into DRAM for candidate pre-filtering.
+Divergence: NSW, m_max=32, ef_c=200, v3 BFS page-packed adjacency
+
+=== DiskANN Search Results ===
+Build: R=32, L=200, 1 thread, 151.9s
+Search: beam_width=4, 1 thread
+Source: diskann-benchmark (Rust)
+
+--- num_nodes_to_cache=0 (no cache) ---
+   L   recall    QPS   mean_lat_us   p95_us   p999_us   IOs/q   cache_hit%
+ 100    63.42   175.7      5689       7599     22550     110.2     0.0
+ 150    76.14   123.9      8066      10489     20613     159.2     0.0
+ 200    83.71   100.1      9984      12440     21415     208.4     0.0
+ 250    88.34    84.3     11858      14792     34953     257.7     0.0
+ 300    91.36    73.8     13547      15989     34980     307.4     0.0
+ 400    94.94    58.4     17122      19675     37428     406.6     0.0
+ 500    96.78    47.4     21114      26899     54862     506.1     0.0
+ 600    97.84    40.9     24457      27018     60035     605.7     0.0
+ 800    98.92    31.5     31777      34411     68239     805.0     0.0
+1000    99.37    25.6     39037      41556     73765    1004.5     0.0
+
+--- num_nodes_to_cache=250 (~1MB) ---
+   L   recall    QPS   mean_lat_us   IOs/q   cache_hit%
+ 200    83.71   105.8      9449      208.4     0.0
+ 300    91.36    75.9     13173      307.4     0.0
+ 400    94.94    59.3     16862      406.6     0.0
+ 500    96.78    48.8     20498      506.1     0.0
+ 600    97.84    41.4     24139      605.7     0.0
+
+--- num_nodes_to_cache=1000 (~4MB) ---
+   L   recall    QPS   mean_lat_us   IOs/q   cache_hit%
+ 200    83.71   107.5      9300      208.4     0.0
+ 300    91.36    76.9     13004      307.4     0.0
+ 400    94.94    60.3     16593      406.6     0.0
+ 500    96.78    49.3     20301      506.1     0.0
+ 600    97.84    41.2     24266      605.7     0.0
+
+--- num_nodes_to_cache=5000 (~20MB) ---
+   L   recall    QPS   mean_lat_us   IOs/q   cache_hit%
+ 200    83.71   110.7      9032      208.4     0.0
+ 300    91.36    79.1     12636      307.4     0.0
+ 400    94.94    61.6     16230      406.6     0.0
+ 500    96.78    50.5     19783      506.1     0.0
+ 600    97.84    42.9     23331      605.7     0.0
+
+DiskANN cache observation: cache_hit% = 0.0% across ALL cache sizes.
+IOs/q unchanged at every L regardless of cache. Caching has no measurable
+effect. This may be because at 100K scale the medoid/entry node set is trivial,
+or because the DiskANN Rust cache implementation doesn't cache the sectors
+being read during search (only caches BFS-ordered warm nodes at startup).
+
+=== Divergence v3 Search Results ===
+Build: m_max=32, ef_c=200, v3 BFS reorder, 1 thread
+
+--- Warm (5% cache, cross-query warming) ---
+config           ef   recall    QPS   p50_ms   p99_ms   phy/q    hit%
+v3-warm         200    96.3   137.9     7.1      9.6    114.2    90.6
+v3-warm-ef225   225    96.8   125.8     7.9     10.1    126.2    90.9
+v3-warm-ef250   250    97.3   113.9     8.7     10.9    140.3    91.2
+v3-warm-ef300   300    97.9    97.5    10.2     12.4    166.1    91.7
+
+--- Per-query cold (pool.clear() before each query, no cross-query state) ---
+config           ef   recall    QPS   p50_ms   p99_ms   phy/q    hit%
+v3-perq-cold    200    96.3   109.5     7.9     10.1    135.2    88.3
+v3-perq-ef225   225    96.8   102.5     8.7     10.7    148.5    88.9
+v3-perq-ef250   250    97.3    92.8     9.5     14.9    161.2    89.5
+
+=== Iso-Recall Comparison: recall ≈ 96.8% ===
+
+Latency metric: DiskANN reports mean, Divergence reports p50 (median).
+QPS = nq / wall_seconds — comparable across both (unambiguous).
+
+                       recall   QPS    lat_ms*   IO/q    DRAM_est   cache_config
+DiskANN L=500 no$      96.78   47.4    21.1m    506.1    ~10 MB    no cache
+DiskANN L=500 c250     96.78   48.8    20.5m    506.1    ~11 MB    250 nodes (~1MB)
+DiskANN L=500 c5000    96.78   50.5    19.8m    506.1    ~30 MB    5000 nodes (~20MB)
+Divg v3-warm ef225     96.8   125.8     7.9p    126.2    ~295 MB   5% pool (~300KB)
+Divg v3-perq ef225     96.8   102.5     8.7p    148.5    ~295 MB   1MB pool, perq clear
+
+ * m = mean latency, p = p50 (median). Not directly comparable.
+ $ = baseline (no cache)
+
+At iso-recall 96.8%:
+  QPS:  Divergence v3-perq-cold (102.5) vs DiskANN no-cache (47.4) = 2.16x
+  QPS:  Divergence v3-warm (125.8) vs DiskANN c5000 (50.5) = 2.49x
+  IO/q: Divergence v3-perq (148.5) vs DiskANN (506.1) = 3.41x fewer IOs
+  IO/q: Divergence v3-warm (126.2) vs DiskANN (506.1) = 4.01x fewer IOs
+
+=== Iso-Recall Comparison: recall ≈ 97.3% ===
+
+                       recall   QPS    lat_ms*   IO/q
+DiskANN L=600           97.84   40.9    24.5m    605.7
+Divg v3-warm ef250      97.3   113.9     8.7p    140.3
+Divg v3-perq ef250      97.3    92.8     9.5p    161.2
+
+  QPS:  Divergence v3-perq (92.8) vs DiskANN (40.9) = 2.27x
+  IO/q: Divergence v3-perq (161.2) vs DiskANN (605.7) = 3.76x fewer IOs
+
+NOTE: Recall not exactly aligned (97.3 vs 97.8). DiskANN is 0.5pp higher.
+The comparison slightly favors Divergence (higher recall costs more IO).
+
+=== Analysis ===
+
+1. QPS ADVANTAGE IS CONSISTENT ACROSS RECALL LEVELS:
+   At recall≈96.8%: Divergence 2.2-2.5x faster (perq-cold to warm range)
+   At recall≈97.3%: Divergence 2.3x faster (perq-cold)
+   The gap is structural, not a single-point artifact.
+
+2. IO REDUCTION IS THE PRIMARY DRIVER:
+   DiskANN IOs/q ≈ L (each hop = 1 sector read).
+   Divergence phy/q = 148.5 at ef=225 perq-cold (226 expansions → 148 reads).
+   The gap comes from:
+   a) BFS page packing: co-accessed VIDs share pages → fewer unique page reads
+   b) Vectors in DRAM: Divergence scores from DRAM, zero IO for vector access.
+      DiskANN co-locates vectors in sectors, so every hop reads vector data too.
+
+3. DiskANN GRAPH QUALITY GAP:
+   At L=200 (same search budget as ef=200):
+     DiskANN: 83.7% recall
+     Divergence: 96.3% recall
+   DiskANN needs L=500 (2.5x more hops) to match Divergence ef=200.
+
+   This gap likely comes from graph construction differences:
+   - Vamana alpha-pruning may be too aggressive for cosine/high-dim
+   - DiskANN disk-index build uses PQ-compressed distances during construction
+   - NSW bidirectional edge insertion may produce better local connectivity
+   Needs DiskANN R=64 or L_build=300 test to confirm.
+
+4. DiskANN CACHE IS INEFFECTIVE AT 100K:
+   Cache hit% = 0.0% at all cache sizes (250/1000/5000 nodes).
+   IOs/q unchanged. QPS improves marginally (47.4 → 50.5 at L=500 with 5000 nodes).
+   The ~6% QPS gain may be from reduced PQ preprocessing (cached nodes skip PQ),
+   not from IO reduction.
+
+5. MEMORY TRADEOFF — THE ELEPHANT IN THE ROOM:
+   Divergence DRAM: ~295 MB (293 MB vectors + 782 KB adj_index + cache)
+   DiskANN DRAM: ~10 MB (9.2 MB PQ + 776 KB pivots)
+
+   Divergence uses 30x more DRAM. This is the structural reason it does fewer IOs.
+   At Cohere 100K (295 MB), this is trivial.
+   At Cohere 1B, Divergence would need ~2.9 TB DRAM for vectors — impractical.
+   DiskANN's architecture is designed for the regime where vectors don't fit in DRAM.
+
+   Fair headline: "At equal dataset size where vectors fit in DRAM, Divergence is
+   2.2x faster and does 3.4x fewer IOs. The advantage comes from DRAM vectors +
+   page packing, at the cost of 30x more memory."
+
+=== Disk Usage (measured) ===
+
+Component                    DiskANN               Divergence v3
+disk.index                   391 MB                -
+pq_compressed.bin             9.2 MB               -
+pq_pivots.bin                776 KB                -
+adjacency_pages.dat          -                     6.1 MB (1537 pages × 4KB)
+adj_index.dat                -                     782 KB
+vectors.dat                  -                     293 MB
+Total on disk                402 MB                300 MB
+
+=== DRAM Usage (measured) ===
+
+Component                    DiskANN               Divergence v3
+Vectors                      0 (on disk)           293 MB (FP32, VectorBank)
+PQ codes                     9.2 MB                0
+PQ pivots                    776 KB                0
+adj_index                    N/A                   782 KB
+AdjacencyPool cache          N/A                   32KB-4MB (configurable)
+Total DRAM                   ~10 MB                ~295 MB
+
+=== Remaining TODO ===
+
+1. [ ] DiskANN with R=64, L_build=300: test if graph quality gap narrows
+2. [ ] OS-level /proc/diskstats validation for both systems
+3. [ ] Report p50 for DiskANN (need to parse per-query latency distribution)
+4. [ ] Multi-thread comparison (both systems)

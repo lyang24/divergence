@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 
 use crate::MetricType;
+use crate::quantization::pq::{PqCodebook, PqDistanceTable};
 use half::f16;
 use half::slice::HalfFloatSliceExt;
 
@@ -677,7 +678,241 @@ impl VectorBank for Int8PreparedBank<'_> {
     }
 }
 
-/// Inner product distance: pure f32, negated.
+// ─── PQ-backed vector bank (codes in DRAM, LUT per query) ─────────────────
+
+/// PQ vector bank: holds flat PQ codes (N × M bytes) and codebook reference.
+///
+/// Two usage modes:
+/// 1. **Prepared** (efficient): call `prepare(query)` once per query, use the
+///    returned `PqPreparedBank` as `VectorBank`. O(M) distance per neighbor.
+/// 2. **Direct** (convenient): use `PqVectorBank` itself as `VectorBank`.
+///    Caches the LUT in a `RefCell`, auto-rebuilds when query changes.
+///    Slightly slower due to RefCell borrow overhead, but compatible with
+///    functions that take `&dyn VectorBank` for multiple queries.
+pub struct PqVectorBank<'a> {
+    /// Flat PQ codes: codes[vid * m .. vid * m + m] = M-byte code for vid.
+    codes: &'a [u8],
+    /// Number of subquantizers (code length per vector).
+    m: usize,
+    /// Number of vectors.
+    n: usize,
+    /// Full vector dimension (for trait compliance).
+    dim: usize,
+    /// Codebook reference (for building LUT).
+    codebook: &'a PqCodebook,
+    /// Whether to use inner product (cosine on normalized vectors).
+    use_inner_product: bool,
+    /// Cached LUT + the query pointer it was built from.
+    /// Using raw pointer for query identity check (same slice = same query).
+    cached_lut: RefCell<Option<(*const f32, PqDistanceTable)>>,
+}
+
+impl<'a> PqVectorBank<'a> {
+    pub fn new(
+        codes: &'a [u8],
+        n: usize,
+        dim: usize,
+        codebook: &'a PqCodebook,
+        use_inner_product: bool,
+    ) -> Self {
+        let m = codebook.m;
+        assert_eq!(codes.len(), n * m, "PQ codes length mismatch: {} != {} * {}", codes.len(), n, m);
+        Self { codes, m, n, dim, codebook, use_inner_product, cached_lut: RefCell::new(None) }
+    }
+
+    /// Build per-query ADC lookup table. Returns a `PqPreparedBank` that
+    /// implements `VectorBank` with O(M) distance per neighbor.
+    pub fn prepare<'b>(&'b self, query: &[f32]) -> PqPreparedBank<'b>
+    where
+        'a: 'b,
+    {
+        let lut = self.codebook.build_distance_table(query, self.use_inner_product);
+        PqPreparedBank {
+            codes: self.codes,
+            m: self.m,
+            n: self.n,
+            dim: self.dim,
+            lut,
+        }
+    }
+
+    /// Ensure cached LUT matches the given query. Rebuild if needed.
+    fn ensure_lut(&self, query: &[f32]) {
+        let query_ptr = query.as_ptr();
+        let needs_rebuild = {
+            let cached = self.cached_lut.borrow();
+            match cached.as_ref() {
+                Some((ptr, _)) => *ptr != query_ptr,
+                None => true,
+            }
+        };
+        if needs_rebuild {
+            let lut = self.codebook.build_distance_table(query, self.use_inner_product);
+            *self.cached_lut.borrow_mut() = Some((query_ptr, lut));
+        }
+    }
+}
+
+impl VectorBank for PqVectorBank<'_> {
+    fn distance(&self, query: &[f32], vid: usize) -> f32 {
+        self.ensure_lut(query);
+        let cached = self.cached_lut.borrow();
+        let (_, lut) = cached.as_ref().unwrap();
+        let offset = vid * self.m;
+        let code = &self.codes[offset..offset + self.m];
+        if lut.use_inner_product() {
+            lut.approximate_cosine_distance(code)
+        } else {
+            lut.approximate_distance(code)
+        }
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.n
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
+/// Pre-computed PQ distance bank for a single query.
+///
+/// Created via `PqVectorBank::prepare(query)`. Holds the per-query ADC lookup
+/// table. `distance(_query, vid)` does M table lookups (no float multiply).
+///
+/// For cosine on L2-normalized vectors with `use_inner_product=true`:
+///   distance = 1.0 - sum(lut[m][code[m]])
+/// For L2:
+///   distance = sum(lut[m][code[m]])
+pub struct PqPreparedBank<'a> {
+    codes: &'a [u8],
+    m: usize,
+    n: usize,
+    dim: usize,
+    lut: PqDistanceTable,
+}
+
+impl VectorBank for PqPreparedBank<'_> {
+    fn distance(&self, _query: &[f32], vid: usize) -> f32 {
+        let offset = vid * self.m;
+        let code = &self.codes[offset..offset + self.m];
+        if self.lut.use_inner_product() {
+            self.lut.approximate_cosine_distance(code)
+        } else {
+            self.lut.approximate_distance(code)
+        }
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.n
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SaqVectorBank — SAQ proxy distance (loaded from C++ export)
+// ---------------------------------------------------------------------------
+
+/// SAQ proxy distance bank. Caches per-query rotation + precomputed state.
+///
+/// Distance returned is L2² (same ordering as exact L2² for ranking).
+/// For normalized vectors, L2² = 2 - 2·⟨o,q⟩, so ranking is equivalent.
+pub struct SaqVectorBank<'a> {
+    data: &'a crate::quantization::saq::SaqData,
+    cached: RefCell<Option<(*const f32, crate::quantization::saq::SaqQueryState)>>,
+}
+
+impl<'a> SaqVectorBank<'a> {
+    pub fn new(data: &'a crate::quantization::saq::SaqData) -> Self {
+        Self {
+            data,
+            cached: RefCell::new(None),
+        }
+    }
+
+    fn ensure_prepared(&self, query: &[f32]) {
+        let ptr = query.as_ptr();
+        let needs = match self.cached.borrow().as_ref() {
+            Some((p, _)) => *p != ptr,
+            None => true,
+        };
+        if needs {
+            let state = crate::quantization::saq::SaqQueryState::prepare(query, &self.data.segments);
+            *self.cached.borrow_mut() = Some((ptr, state));
+        }
+    }
+}
+
+impl VectorBank for SaqVectorBank<'_> {
+    fn distance(&self, query: &[f32], vid: usize) -> f32 {
+        self.ensure_prepared(query);
+        let cached = self.cached.borrow();
+        let (_, state) = cached.as_ref().unwrap();
+        state.estimate_l2sqr(self.data, vid)
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.data.n
+    }
+
+    fn dimension(&self) -> usize {
+        self.data.full_dim
+    }
+}
+
+//// ---------------------------------------------------------------------------
+// SaqPackedVectorBank — packed 4-bit SAQ proxy distance
+// ---------------------------------------------------------------------------
+
+/// Packed 4-bit SAQ proxy distance bank.
+pub struct SaqPackedVectorBank<'a> {
+    data: &'a crate::quantization::saq::SaqPackedData,
+    cached: RefCell<Option<(*const f32, crate::quantization::saq::SaqPackedQueryState)>>,
+}
+
+impl<'a> SaqPackedVectorBank<'a> {
+    pub fn new(data: &'a crate::quantization::saq::SaqPackedData) -> Self {
+        Self {
+            data,
+            cached: RefCell::new(None),
+        }
+    }
+
+    fn ensure_prepared(&self, query: &[f32]) {
+        let ptr = query.as_ptr();
+        let needs = match self.cached.borrow().as_ref() {
+            Some((p, _)) => *p != ptr,
+            None => true,
+        };
+        if needs {
+            let state = crate::quantization::saq::SaqPackedQueryState::prepare(query, self.data);
+            *self.cached.borrow_mut() = Some((ptr, state));
+        }
+    }
+}
+
+impl VectorBank for SaqPackedVectorBank<'_> {
+    fn distance(&self, query: &[f32], vid: usize) -> f32 {
+        self.ensure_prepared(query);
+        let cached = self.cached.borrow();
+        let (_, state) = cached.as_ref().unwrap();
+        state.estimate_l2sqr(self.data, vid)
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.data.n
+    }
+
+    fn dimension(&self) -> usize {
+        self.data.dim
+    }
+}
+
+// Inner product distance: pure f32, negated.
 #[inline]
 fn ip_f32(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
@@ -1460,5 +1695,73 @@ mod tests {
         );
 
         assert!(sink != 0.0);
+    }
+
+    #[test]
+    fn pq_vector_bank_basic() {
+        // 256 vectors, 16 dims, PQ4 (4 subspaces, 4 dims each)
+        let n = 256;
+        let dim = 16;
+        let m = 4;
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = 42u64;
+        for i in 0..n * dim {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data[i] = ((rng >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        }
+
+        let cb = PqCodebook::train(&data, n, dim, m, 15, 42);
+        let codes = cb.encode_all(&data, n);
+
+        // Test PqVectorBank (auto-LUT caching)
+        let bank = PqVectorBank::new(&codes, n, dim, &cb, false);
+        let query = &data[0..dim];
+
+        // Self-distance should be small
+        let self_dist = bank.distance(query, 0);
+        assert!(self_dist < 0.5, "PQ self-distance too large: {self_dist}");
+
+        // Distance to a far vector should be larger
+        let far_dist = bank.distance(query, n / 2);
+        // (not guaranteed larger for random data, but check it returns a finite value)
+        assert!(far_dist.is_finite());
+
+        // num_vectors / dimension
+        assert_eq!(bank.num_vectors(), n);
+        assert_eq!(bank.dimension(), dim);
+
+        // Test PqPreparedBank
+        let prepared = bank.prepare(query);
+        let self_dist2 = prepared.distance(query, 0);
+        assert!((self_dist - self_dist2).abs() < 1e-6, "Prepared vs direct mismatch");
+    }
+
+    #[test]
+    fn pq_vector_bank_lut_caching() {
+        // Verify that PqVectorBank rebuilds LUT when query changes
+        let n = 256;
+        let dim = 8;
+        let m = 2;
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = 123u64;
+        for i in 0..n * dim {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            data[i] = ((rng >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        }
+
+        let cb = PqCodebook::train(&data, n, dim, m, 10, 42);
+        let codes = cb.encode_all(&data, n);
+        let bank = PqVectorBank::new(&codes, n, dim, &cb, false);
+
+        let q1 = &data[0..dim];
+        let q2 = &data[dim..2 * dim];
+
+        let d1_v0 = bank.distance(q1, 0);
+        let d2_v0 = bank.distance(q2, 0);
+
+        // Different queries should give different distances to the same vector
+        // (unless by coincidence, which is astronomically unlikely for random data)
+        assert!((d1_v0 - d2_v0).abs() > 1e-6,
+            "LUT caching broken: same distance for different queries ({d1_v0} vs {d2_v0})");
     }
 }

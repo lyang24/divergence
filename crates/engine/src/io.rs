@@ -555,6 +555,70 @@ unsafe impl monoio::buf::IoBufMut for SlotBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VectorReader — async reader for FP32 vectors from vectors.dat
+// ---------------------------------------------------------------------------
+
+/// Async reader for FP32 vectors stored on disk (vectors.dat).
+///
+/// Used by v4 two-stage search: graph traversal uses PQ proxy distances (DRAM),
+/// then refine reads FP32 vectors from disk for exact re-scoring.
+///
+/// Each vector is `dim × 4` bytes at offset `vid × dim × 4`.
+/// O_DIRECT requires 512-byte aligned reads, so we round up the read size.
+pub struct VectorReader {
+    file: File,
+    dim: usize,
+    /// Bytes per vector (dim * 4).
+    vec_bytes: usize,
+}
+
+impl VectorReader {
+    pub async fn open(index_dir: &str, dim: usize, direct_io: bool) -> io::Result<Self> {
+        let path = format!("{}/vectors.dat", index_dir);
+        let mut opts = monoio::fs::OpenOptions::new();
+        opts.read(true);
+        if direct_io {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        let file = opts.open(&path).await?;
+        let vec_bytes = dim * 4;
+        Ok(Self { file, dim, vec_bytes })
+    }
+
+    /// Read one FP32 vector from disk by VID. Returns `dim` floats.
+    pub async fn read_vector(&self, vid: u32) -> io::Result<Vec<f32>> {
+        // O_DIRECT: offset must be 512-aligned. vid * vec_bytes may not be.
+        // Compute the aligned offset and the intra-block offset.
+        let raw_offset = vid as u64 * self.vec_bytes as u64;
+        let align_offset = raw_offset & !511;
+        let intra_offset = (raw_offset - align_offset) as usize;
+        let total_read = ((intra_offset + self.vec_bytes) + 511) & !511;
+
+        let buf = AlignedBuf::new(total_read);
+        let (result, buf) = self.file.read_at(buf, align_offset).await;
+        let n = result?;
+        if n < intra_offset + self.vec_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short vector read: {} bytes (need {})", n, intra_offset + self.vec_bytes),
+            ));
+        }
+
+        // Extract the f32 vector from the aligned buffer
+        let bytes = buf.as_slice();
+        let vec_bytes = &bytes[intra_offset..intra_offset + self.vec_bytes];
+        let f32_slice = unsafe {
+            std::slice::from_raw_parts(vec_bytes.as_ptr() as *const f32, self.dim)
+        };
+        Ok(f32_slice.to_vec())
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

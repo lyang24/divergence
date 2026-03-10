@@ -16,7 +16,7 @@ pub use engine::{
     CoreSetup, Engine, EngineConfig, EngineHealth, EngineStats, GlobalQueryLimiter,
     HealthChecker, QueryPermit,
 };
-pub use io::{GlobalIoBudget, IoDriver, default_global_qd};
+pub use io::{GlobalIoBudget, IoDriver, VectorReader, default_global_qd};
 pub use perf::{
     CoreSnapshot, Histogram, PerfLevel, QueryRecorder, SchedLagTracker, SearchGuard,
     SearchPerfContext,
@@ -24,5 +24,5 @@ pub use perf::{
 pub use runtime::{spawn_worker, WorkerConfig};
 pub use search::{
     disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
-    disk_graph_search_pq, disk_graph_search_refine,
+    disk_graph_search_pipe_v3_refine, disk_graph_search_pq, disk_graph_search_refine,
 };

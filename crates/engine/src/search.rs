@@ -1181,3 +1181,90 @@ pub async fn disk_graph_search_pq(
 
     results
 }
+
+/// Two-stage v4 search: PQ proxy traversal (v3 pages) + parallel FP32 disk refine.
+///
+/// 1. Run `disk_graph_search_pipe_v3` with `cheap_bank` (PQ codes in DRAM) → collect top-R
+/// 2. Read FP32 vectors from disk in parallel (monoio::spawn batches, bounded inflight)
+/// 3. Re-score with exact cosine distance, return top-k
+///
+/// This is the fair-comparison architecture: PQ codes (~10MB) + adjacency in DRAM,
+/// FP32 vectors on disk — same DRAM budget as DiskANN.
+pub async fn disk_graph_search_pipe_v3_refine(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    refine_r: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    cheap_bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    vec_reader: &std::rc::Rc<crate::io::VectorReader>,
+    refine_inflight: usize,
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+) -> Vec<ScoredId> {
+    use std::rc::Rc;
+
+    // Stage 1: PQ graph traversal via v3 page-packed adjacency
+    let candidates = disk_graph_search_pipe_v3(
+        query, entry_set, refine_r, ef, prefetch_window,
+        stall_limit, drain_budget, pool, io, cheap_bank, adj_index, perf, level,
+    )
+    .await;
+
+    // Stage 2: parallel FP32 vector reads + exact cosine rescore.
+    // Each spawned task returns its result; no shared mutable state.
+    let timing = level >= PerfLevel::EnableTime;
+    let refine_start = if timing { Some(Instant::now()) } else { None };
+
+    // Precompute query norm (constant across all R candidates)
+    let norm_a: f32 = query.iter().map(|&x| x * x).sum();
+
+    // Copy query to owned Vec so spawned tasks can capture it ('static).
+    let query_rc = Rc::new(query.to_vec());
+
+    // Parallel batch reads bounded by refine_inflight.
+    let mut refined = Vec::with_capacity(candidates.len());
+
+    for batch in candidates.chunks(refine_inflight) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for &c in batch {
+            let vid = c.id.0;
+            let vr = Rc::clone(vec_reader);
+            let q = Rc::clone(&query_rc);
+            let handle = monoio::spawn(async move {
+                match vr.read_vector(vid).await {
+                    Ok(vec_data) => {
+                        let dot: f32 = q.iter().zip(vec_data.iter()).map(|(&a, &b)| a * b).sum();
+                        let norm_b: f32 = vec_data.iter().map(|&x| x * x).sum();
+                        let denom = (norm_a * norm_b).sqrt();
+                        let dist = if denom == 0.0 { 1.0 } else { 1.0 - dot / denom };
+                        ScoredId { distance: dist, id: c.id }
+                    }
+                    Err(_) => c,
+                }
+            });
+            handles.push(handle);
+        }
+        // Await all tasks in this batch — io_uring processes them concurrently
+        for h in handles {
+            refined.push(h.await);
+        }
+    }
+
+    perf.refine_count = refined.len() as u64;
+
+    if let Some(start) = refine_start {
+        perf.refine_ns += start.elapsed().as_nanos() as u64;
+    }
+
+    // Sort by refined distance, return top-k
+    refined.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+    refined.truncate(k);
+    refined
+}

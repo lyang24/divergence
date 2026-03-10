@@ -1,0 +1,69 @@
+{
+  "search_directories": [],
+  "output_directory": null,
+  "jobs": [
+    {
+      "type": "disk-index",
+      "content": {
+        "source": {
+          "disk-index-source": "Load",
+          "data_type": "float32",
+          "load_path": "/mnt/nvme/diskann_index/cohere100k"
+        },
+        "search_phase": {
+          "queries": "/mnt/nvme/divergence/data/cohere_100k/diskann/query_f32.bin",
+          "groundtruth": "/mnt/nvme/divergence/data/cohere_100k/diskann/gt.bin",
+          "num_threads": 1,
+          "beam_width": 4,
+          "search_list": [200, 300, 400, 500, 600],
+          "recall_at": 100,
+          "is_flat_search": false,
+          "distance": "squared_l2",
+          "num_nodes_to_cache": 250
+        }
+      }
+    },
+    {
+      "type": "disk-index",
+      "content": {
+        "source": {
+          "disk-index-source": "Load",
+          "data_type": "float32",
+          "load_path": "/mnt/nvme/diskann_index/cohere100k"
+        },
+        "search_phase": {
+          "queries": "/mnt/nvme/divergence/data/cohere_100k/diskann/query_f32.bin",
+          "groundtruth": "/mnt/nvme/divergence/data/cohere_100k/diskann/gt.bin",
+          "num_threads": 1,
+          "beam_width": 4,
+          "search_list": [200, 300, 400, 500, 600],
+          "recall_at": 100,
+          "is_flat_search": false,
+          "distance": "squared_l2",
+          "num_nodes_to_cache": 1000
+        }
+      }
+    },
+    {
+      "type": "disk-index",
+      "content": {
+        "source": {
+          "disk-index-source": "Load",
+          "data_type": "float32",
+          "load_path": "/mnt/nvme/diskann_index/cohere100k"
+        },
+        "search_phase": {
+          "queries": "/mnt/nvme/divergence/data/cohere_100k/diskann/query_f32.bin",
+          "groundtruth": "/mnt/nvme/divergence/data/cohere_100k/diskann/gt.bin",
+          "num_threads": 1,
+          "beam_width": 4,
+          "search_list": [200, 300, 400, 500, 600],
+          "recall_at": 100,
+          "is_flat_search": false,
+          "distance": "squared_l2",
+          "num_nodes_to_cache": 5000
+        }
+      }
+    }
+  ]
+}
