@@ -6728,8 +6728,13 @@ async fn run_bench_v3_refine_int8(
 }
 
 fn print_bench_header(n: usize, dim: usize, num_queries: usize, warmup_queries: usize) {
-    eprintln!("\n=== BENCH: Cohere {}K, dim={}, GT=brute-force, seed=42, nq={}, warmup={} ===",
-        n / 1000, dim, num_queries, warmup_queries);
+    print_bench_header_layout(n, dim, num_queries, warmup_queries, None);
+}
+
+fn print_bench_header_layout(n: usize, dim: usize, num_queries: usize, warmup_queries: usize, layout: Option<&str>) {
+    let layout_str = layout.map(|l| format!(", layout={}", l)).unwrap_or_default();
+    eprintln!("\n=== BENCH: Cohere {}K, dim={}, GT=brute-force, seed=42, nq={}, warmup={}{} ===",
+        n / 1000, dim, num_queries, warmup_queries, layout_str);
     eprintln!(
         "{:<14} {:>4} {:>4} {:>2} {:>3} {:>3} {:>4} {:>7} {:>7} {:>7} {:>7} {:>5} {:>5} {:>5} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5} {:>5} {:>6} {:>6} {:>7} {:>7} {:>5} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7}",
         "label", "ef", "k", "W", "S", "D", "c%",
@@ -6815,13 +6820,19 @@ fn exp_bench_stable() {
         .unwrap();
     eprintln!("  v1 index written to {} (direct_io={})", dir_str, direct_io);
 
-    // Write v3 page-packed adjacency (BFS reorder) into a subdirectory
+    // Write v3 page-packed adjacency into a subdirectory.
+    // V3_LAYOUT env var selects reorder strategy (default: heavy_edge).
+    let v3_layout = std::env::var("V3_LAYOUT").unwrap_or_else(|_| "heavy_edge".to_string());
     let v3_dir_path = dir_path.join("v3");
     std::fs::create_dir_all(&v3_dir_path).unwrap();
     let v3_dir_str = v3_dir_path.to_str().unwrap().to_owned();
     let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
     let t0_v3 = std::time::Instant::now();
-    let reorder = bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
+    let reorder = match v3_layout.as_str() {
+        "bfs" => bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid)),
+        "heavy_edge" => heavy_edge_reorder_graph(n, |vid| index.neighbors(vid)),
+        other => panic!("unknown V3_LAYOUT '{}' (expected 'bfs' or 'heavy_edge')", other),
+    };
     let v3_writer = IndexWriter::new(&v3_dir_path);
     v3_writer
         .write_v3(
@@ -6829,14 +6840,14 @@ fn exp_bench_stable() {
             &entry_ids,
             index.vectors_raw(), |vid| index.neighbors(vid),
             &reorder,
-            "bfs",
+            &v3_layout,
         )
         .unwrap();
     // Copy vectors.dat to v3 dir (IoDriver + VectorBank need same dir)
     std::fs::copy(dir_path.join("vectors.dat"), v3_dir_path.join("vectors.dat")).unwrap();
     let v3_meta = IndexMeta::load_from(&v3_dir_path.join("meta.json")).unwrap();
-    eprintln!("  v3 index written to {} ({} pages, BFS reorder) in {:.1}s",
-        v3_dir_str, v3_meta.num_pages.unwrap_or(0), t0_v3.elapsed().as_secs_f64());
+    eprintln!("  v3 index written to {} ({} pages, {} reorder) in {:.1}s",
+        v3_dir_str, v3_meta.num_pages.unwrap_or(0), v3_layout, t0_v3.elapsed().as_secs_f64());
 
     let disk_vectors = load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap();
     let entry_set: Vec<VectorId> = {
@@ -7060,7 +7071,7 @@ fn exp_bench_stable() {
             // =================================================================
             // v3 page-packed adjacency benchmarks
             // =================================================================
-            eprintln!("\n--- v3 page-packed adjacency (BFS reorder) ---");
+            eprintln!("\n--- v3 page-packed adjacency ({} reorder) ---", v3_layout);
 
             let io_v3 = Rc::new(
                 IoDriver::open_pages(&v3_dir_str, dim, 64, direct_io)
@@ -7199,7 +7210,7 @@ fn exp_bench_stable() {
             // =================================================================
             // Hub pinning benchmark: pin first N pages, measure benefit
             // =================================================================
-            eprintln!("\n--- Hub pinning (v3, BFS-reordered pages) ---");
+            eprintln!("\n--- Hub pinning (v3, {}-reordered pages) ---", v3_layout);
             print_bench_header(n, dim, num_queries, 0);
 
             for &pin_count in &[64u32, 128u32] {
@@ -8726,7 +8737,7 @@ fn exp_saq_graph() {
     let index = builder.build();
     eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
 
-    // Write v3 page-packed adjacency
+    // Write v1 index (for vectors.dat) + both v3 layouts (BFS and heavy_edge)
     let bench_dir = std::env::var("BENCH_DIR").ok();
     let direct_io = bench_dir.is_some();
     let _tmpdir;
@@ -8738,105 +8749,159 @@ fn exp_saq_graph() {
         _tmpdir = tempfile::tempdir().unwrap();
         dir_path = _tmpdir.path().to_path_buf();
     }
-    let v3_dir = dir_path.join("v3");
-    std::fs::create_dir_all(&v3_dir).unwrap();
 
     let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
-    let reorder = bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
     let writer = IndexWriter::new(&dir_path);
     writer.write(
         n as u32, dim, "cosine", index.max_degree(), ef_construction,
         &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
     ).unwrap();
-    let v3_writer = IndexWriter::new(&v3_dir);
-    v3_writer.write_v3(
-        n as u32, dim, "cosine", index.max_degree(), ef_construction,
-        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
-        &reorder,
-        "bfs",
-    ).unwrap();
-    std::fs::copy(dir_path.join("vectors.dat"), v3_dir.join("vectors.dat")).unwrap();
-    let v3_meta = IndexMeta::load_from(&v3_dir.join("meta.json")).unwrap();
-    let v3_num_pages = v3_meta.num_pages.unwrap_or(0) as usize;
-    eprintln!("  v3 index: {} pages ({:.1} MB adjacency)",
-        v3_num_pages, v3_num_pages as f64 * 4096.0 / 1024.0 / 1024.0);
+
+    // Build both v3 layouts from the same graph
+    struct V3Layout {
+        label: &'static str,
+        dir: std::path::PathBuf,
+        num_pages: usize,
+        adj_index: Vec<AdjIndexEntry>,
+    }
+    let layout_specs: Vec<(&str, Vec<u32>)> = vec![
+        ("bfs", bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid))),
+        ("heavy_edge", heavy_edge_reorder_graph(n, |vid| index.neighbors(vid))),
+    ];
+    let mut v3_layouts: Vec<V3Layout> = Vec::new();
+    for (label, reorder) in &layout_specs {
+        let v3_dir = dir_path.join(format!("v3_{}", label));
+        std::fs::create_dir_all(&v3_dir).unwrap();
+        let t0 = std::time::Instant::now();
+        let v3_writer = IndexWriter::new(&v3_dir);
+        v3_writer.write_v3(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+            reorder, label,
+        ).unwrap();
+        std::fs::copy(dir_path.join("vectors.dat"), v3_dir.join("vectors.dat")).unwrap();
+        let meta = IndexMeta::load_from(&v3_dir.join("meta.json")).unwrap();
+        let num_pages = meta.num_pages.unwrap_or(0) as usize;
+        let adj_index = load_adj_index(&v3_dir.join("adj_index.dat"), n).unwrap();
+        eprintln!("  v3_{}: {} pages ({:.1} MB adj), adj_reorder={:?}, built in {:.1}s",
+            label, num_pages, num_pages as f64 * 4096.0 / 1024.0 / 1024.0,
+            meta.adj_reorder.as_deref().unwrap_or("none"), t0.elapsed().as_secs_f64());
+        v3_layouts.push(V3Layout { label, dir: v3_dir, num_pages, adj_index });
+    }
 
     let disk_vectors = load_vectors(&dir_path.join("vectors.dat"), n, dim).unwrap();
     let entry_set: Vec<VectorId> = {
         let meta = IndexMeta::load_from(&dir_path.join("meta.json")).unwrap();
         meta.entry_set.iter().map(|&v| VectorId(v)).collect()
     };
-    let adj_index = load_adj_index(&v3_dir.join("adj_index.dat"), v3_meta.num_vectors as usize).unwrap();
 
     let num_queries = nq.min(100);
     let query_vecs: Vec<Vec<f32>> = queries_flat
         .chunks_exact(dim).take(num_queries).map(|c| c.to_vec()).collect();
 
-    // Pool sizing: fraction of actual v3 pages, not n*4096
     let cache_pct = 5usize;
-    let pool_pages = (v3_num_pages * cache_pct / 100).max(256);
-    let pool_bytes = pool_pages * 4096;
-    eprintln!("  Pool: {} pages ({:.1} MB) = {}% of {} v3 pages",
-        pool_pages, pool_bytes as f64 / 1024.0 / 1024.0, cache_pct, v3_num_pages);
+    let prefetch_budget = 4;
 
-    let v3_dir_str = v3_dir.to_str().unwrap().to_owned();
     if !with_runtime(|rt| {
         rt.block_on(async {
-            let io = Rc::new(
-                IoDriver::open_pages(&v3_dir_str, dim, 64, direct_io)
-                    .await
-                    .expect("failed to open IO driver"),
-            );
-
             let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
             let saq_bank = divergence_core::SaqVectorBank::new(&saq_data);
-            let prefetch_budget = 4;
-
-            // Use packed bank if available, else fall back to unpacked
             let saq_packed_bank = saq_packed.as_ref()
                 .map(|p| divergence_core::SaqPackedVectorBank::new(p));
-
-            // Pick the best SAQ bank: packed if single-segment B=4, else unpacked
             let saq_bench_bank: &dyn VectorBank = match saq_packed_bank.as_ref() {
                 Some(pb) => pb,
                 None => &saq_bank,
             };
             let saq_label = if saq_packed_bank.is_some() { "SAQ-pack4" } else { "SAQ-unpack" };
 
-            print_bench_header(n, dim, num_queries, 10);
+            // ============================================================
+            // Run SAQ graph-only + SAQ+refine for EACH v3 layout
+            // ============================================================
+            for layout in &v3_layouts {
+                let v3_dir_str = layout.dir.to_str().unwrap().to_owned();
+                let pool_pages = (layout.num_pages * cache_pct / 100).max(256);
+                let pool_bytes = pool_pages * 4096;
+                eprintln!("\n========== Layout: {} ({} pages, pool={} pages / {:.1} MB) ==========",
+                    layout.label, layout.num_pages, pool_pages, pool_bytes as f64 / 1024.0 / 1024.0);
 
-            // --- Stage 1: Graph-only (warm + cold) for FP32 and SAQ ---
-            for (label, bank) in [
-                ("FP32-cosine", &fp32_bank as &dyn VectorBank),
-                (saq_label, saq_bench_bank),
-            ] {
-                // Warm run
-                {
-                    let cfg = BenchConfig {
-                        label: format!("{}-warm", label),
-                        ef: 200, k, prefetch_width: 4,
-                        stall_limit: 0, drain_budget: 0,
-                        adj_inflight: 64, cache_pct,
-                        num_queries, warmup_queries: 10,
-                        ada_ef: false,
-                        clear_per_query: false,
-                    };
-                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                    let handle = AdjacencyPool::spawn_prefetch_worker(
-                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                    );
-                    let result = run_bench_v3(
-                        &cfg, &entry_set, &pool, &io, bank,
-                        &adj_index, &query_vecs, &ground_truth,
-                    ).await;
-                    print_bench_row(&cfg, &result);
-                    pool.stop_prefetch();
-                    handle.await;
+                let io = Rc::new(
+                    IoDriver::open_pages(&v3_dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+
+                print_bench_header_layout(n, dim, num_queries, 10, Some(layout.label));
+
+                // --- Stage 1: Graph-only (warm + cold) for FP32 and SAQ ---
+                for (bank_label, bank) in [
+                    ("FP32-cosine", &fp32_bank as &dyn VectorBank),
+                    (saq_label, saq_bench_bank),
+                ] {
+                    // Warm run
+                    {
+                        let cfg = BenchConfig {
+                            label: format!("{}-warm", bank_label),
+                            ef: 200, k, prefetch_width: 4,
+                            stall_limit: 0, drain_budget: 0,
+                            adj_inflight: 64, cache_pct,
+                            num_queries, warmup_queries: 10,
+                            ada_ef: false,
+                            clear_per_query: false,
+                        };
+                        let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                        let handle = AdjacencyPool::spawn_prefetch_worker(
+                            Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                        );
+                        let result = run_bench_v3(
+                            &cfg, &entry_set, &pool, &io, bank,
+                            &layout.adj_index, &query_vecs, &ground_truth,
+                        ).await;
+                        print_bench_row(&cfg, &result);
+                        pool.stop_prefetch();
+                        handle.await;
+                    }
+                    // Cold (per-query clear)
+                    {
+                        let cfg = BenchConfig {
+                            label: format!("{}-cold", bank_label),
+                            ef: 200, k, prefetch_width: 4,
+                            stall_limit: 0, drain_budget: 0,
+                            adj_inflight: 64, cache_pct,
+                            num_queries, warmup_queries: 0,
+                            ada_ef: false,
+                            clear_per_query: true,
+                        };
+                        let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                        let handle = AdjacencyPool::spawn_prefetch_worker(
+                            Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                        );
+                        let result = run_bench_v3(
+                            &cfg, &entry_set, &pool, &io, bank,
+                            &layout.adj_index, &query_vecs, &ground_truth,
+                        ).await;
+                        print_bench_row(&cfg, &result);
+                        pool.stop_prefetch();
+                        handle.await;
+                    }
                 }
-                // Cold (per-query clear)
-                {
+
+                // --- Stage 2: Two-stage SAQ+refine, sweep R ---
+                eprintln!("\n=== Two-Stage v4 [{}]: {} graph → FP32 disk refine (sweep R) ===",
+                    layout.label, saq_label);
+                eprintln!("  NOTE: R capped at ef=200 (search returns at most ef candidates).");
+
+                let vec_reader = Rc::new(
+                    VectorReader::open(&v3_dir_str, dim, direct_io)
+                        .await
+                        .expect("failed to open VectorReader"),
+                );
+                let refine_inflight = 32usize;
+
+                for &refine_r in &[80usize, 120, 160, 200] {
+                    // Cold only (benchmark-fair, most informative)
+                    let label = format!("SAQ+ref-R{}", refine_r);
                     let cfg = BenchConfig {
-                        label: format!("{}-cold", label),
+                        label: label.clone(),
                         ef: 200, k, prefetch_width: 4,
                         stall_limit: 0, drain_budget: 0,
                         adj_inflight: 64, cache_pct,
@@ -8848,315 +8913,311 @@ fn exp_saq_graph() {
                     let handle = AdjacencyPool::spawn_prefetch_worker(
                         Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
                     );
-                    let result = run_bench_v3(
-                        &cfg, &entry_set, &pool, &io, bank,
-                        &adj_index, &query_vecs, &ground_truth,
+                    let result = run_bench_v3_refine(
+                        &cfg, refine_r, refine_inflight,
+                        &entry_set, &pool, &io, saq_bench_bank,
+                        &layout.adj_index, &vec_reader, &query_vecs, &ground_truth,
                     ).await;
                     print_bench_row(&cfg, &result);
                     pool.stop_prefetch();
                     handle.await;
                 }
-            }
 
-            // --- Stage 2: Two-stage v4 refine, sweep refine_r ---
-            eprintln!("\n=== Two-Stage v4: {} graph → FP32 disk refine (sweep R) ===", saq_label);
-            eprintln!("  NOTE: R capped at ef=200 (search returns at most ef candidates).");
-
-            let vec_reader = Rc::new(
-                VectorReader::open(v3_dir.to_str().unwrap(), dim, direct_io)
-                    .await
-                    .expect("failed to open VectorReader"),
-            );
-            let refine_inflight = 32usize;
-
-            for &refine_r in &[80usize, 120, 160, 200] {
-                // Cold only (benchmark-fair, most informative)
-                let label = format!("SAQ+ref-R{}", refine_r);
-                let cfg = BenchConfig {
-                    label: label.clone(),
-                    ef: 200, k, prefetch_width: 4,
-                    stall_limit: 0, drain_budget: 0,
-                    adj_inflight: 64, cache_pct,
-                    num_queries, warmup_queries: 0,
-                    ada_ef: false,
-                    clear_per_query: true,
-                };
-                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                let handle = AdjacencyPool::spawn_prefetch_worker(
-                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                );
-                let result = run_bench_v3_refine(
-                    &cfg, refine_r, refine_inflight,
-                    &entry_set, &pool, &io, saq_bench_bank,
-                    &adj_index, &vec_reader, &query_vecs, &ground_truth,
-                ).await;
-                print_bench_row(&cfg, &result);
-                pool.stop_prefetch();
-                handle.await;
-            }
-
-            // --- Stage 3: Hub pinning + SAQ+refine (R=160) ---
-            eprintln!("\n=== Hub Pinning: SAQ+ref-R160 with pin64/pin128 (perq-cold) ===");
-            for &pin_count in &[64u32, 128u32] {
-                let pin_pages: Vec<u32> = (0..pin_count).collect();
-                let label = format!("SAQ+R160-pin{}", pin_count);
-                let cfg = BenchConfig {
-                    label: label.clone(),
-                    ef: 200, k, prefetch_width: 4,
-                    stall_limit: 0, drain_budget: 0,
-                    adj_inflight: 64, cache_pct,
-                    num_queries, warmup_queries: 0,
-                    ada_ef: false,
-                    clear_per_query: true,
-                };
-                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                let actually_pinned = pool.pin_pages(&pin_pages, &io).await
-                    .expect("pin_pages failed");
-                eprintln!("  pin{}: requested={}, actually_pinned={}",
-                    pin_count, pin_count, actually_pinned);
-                let handle = AdjacencyPool::spawn_prefetch_worker(
-                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                );
-                let result = run_bench_v3_refine(
-                    &cfg, 160, refine_inflight,
-                    &entry_set, &pool, &io, saq_bench_bank,
-                    &adj_index, &vec_reader, &query_vecs, &ground_truth,
-                ).await;
-                print_bench_row(&cfg, &result);
-                pool.stop_prefetch();
-                handle.await;
-            }
-
-            // --- Stage 4: Int8 refine (4× fewer bytes per refine read) ---
-            eprintln!("\n=== Int8 Refine: SAQ graph → int8 disk refine (perq-cold) ===");
-            eprintln!("  Int8 encoding: round(f32 * 127), {} B/vec (vs {} B/vec FP32) = {:.1}× smaller",
-                dim, dim * 4, 4.0);
-
-            // Write int8 vectors to disk
-            let int8_path = v3_dir.join("vectors_int8.dat");
-            write_vectors_int8_file(&int8_path, &disk_vectors, dim).unwrap();
-            let int8_size = std::fs::metadata(&int8_path).unwrap().len();
-            eprintln!("  Wrote vectors_int8.dat: {} vectors × {} B = {:.1} MB",
-                n, dim, int8_size as f64 / 1024.0 / 1024.0);
-
-            let int8_reader = Rc::new(
-                Int8VectorReader::open(v3_dir.to_str().unwrap(), dim, direct_io)
-                    .await
-                    .expect("failed to open Int8VectorReader"),
-            );
-
-            // Sweep R with int8 refine
-            for &refine_r in &[120usize, 160, 200] {
-                let label = format!("i8+ref-R{}", refine_r);
-                let cfg = BenchConfig {
-                    label: label.clone(),
-                    ef: 200, k, prefetch_width: 4,
-                    stall_limit: 0, drain_budget: 0,
-                    adj_inflight: 64, cache_pct,
-                    num_queries, warmup_queries: 0,
-                    ada_ef: false,
-                    clear_per_query: true,
-                };
-                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                let handle = AdjacencyPool::spawn_prefetch_worker(
-                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                );
-                let result = run_bench_v3_refine_int8(
-                    &cfg, refine_r, refine_inflight,
-                    &entry_set, &pool, &io, saq_bench_bank,
-                    &adj_index, &int8_reader, &query_vecs, &ground_truth,
-                ).await;
-                print_bench_row(&cfg, &result);
-                pool.stop_prefetch();
-                handle.await;
-            }
-
-            // Int8 refine + hub pinning (best combo)
-            eprintln!("\n=== Int8 Refine + Hub Pinning (pin128, perq-cold) ===");
-            {
-                let pin_pages: Vec<u32> = (0..128u32).collect();
-                let label = "i8+R160-pin128".to_string();
-                let cfg = BenchConfig {
-                    label: label.clone(),
-                    ef: 200, k, prefetch_width: 4,
-                    stall_limit: 0, drain_budget: 0,
-                    adj_inflight: 64, cache_pct,
-                    num_queries, warmup_queries: 0,
-                    ada_ef: false,
-                    clear_per_query: true,
-                };
-                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                let actually_pinned = pool.pin_pages(&pin_pages, &io).await
-                    .expect("pin_pages failed");
-                eprintln!("  pin128: requested=128, actually_pinned={}", actually_pinned);
-                let handle = AdjacencyPool::spawn_prefetch_worker(
-                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                );
-                let result = run_bench_v3_refine_int8(
-                    &cfg, 160, refine_inflight,
-                    &entry_set, &pool, &io, saq_bench_bank,
-                    &adj_index, &int8_reader, &query_vecs, &ground_truth,
-                ).await;
-                print_bench_row(&cfg, &result);
-                pool.stop_prefetch();
-                handle.await;
-            }
-
-            // --- Stage 5: FP16 refine (2× smaller IO, near-lossless recall) ---
-            eprintln!("\n=== FP16 Refine: SAQ graph → FP16 disk refine (perq-cold) ===");
-            eprintln!("  FP16 encoding: IEEE 754 half-precision, {} B/vec (vs {} B/vec FP32) = 2× smaller",
-                dim * 2, dim * 4);
-
-            let fp16_path = v3_dir.join("vectors_fp16.dat");
-            write_vectors_fp16_file(&fp16_path, &disk_vectors, dim).unwrap();
-            let fp16_size = std::fs::metadata(&fp16_path).unwrap().len();
-            eprintln!("  Wrote vectors_fp16.dat: {} vectors × {} B = {:.1} MB",
-                n, dim * 2, fp16_size as f64 / 1024.0 / 1024.0);
-
-            let fp16_reader = Rc::new(
-                Fp16VectorReader::open(v3_dir.to_str().unwrap(), dim, direct_io)
-                    .await
-                    .expect("failed to open Fp16VectorReader"),
-            );
-
-            // Sweep R with FP16 refine
-            for &refine_r in &[120usize, 160, 200] {
-                let label = format!("f16+ref-R{}", refine_r);
-                let cfg = BenchConfig {
-                    label: label.clone(),
-                    ef: 200, k, prefetch_width: 4,
-                    stall_limit: 0, drain_budget: 0,
-                    adj_inflight: 64, cache_pct,
-                    num_queries, warmup_queries: 0,
-                    ada_ef: false,
-                    clear_per_query: true,
-                };
-                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                let handle = AdjacencyPool::spawn_prefetch_worker(
-                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                );
-                let result = run_bench_v3_refine_fp16(
-                    &cfg, refine_r, refine_inflight,
-                    &entry_set, &pool, &io, saq_bench_bank,
-                    &adj_index, &fp16_reader, &query_vecs, &ground_truth,
-                ).await;
-                print_bench_row(&cfg, &result);
-                pool.stop_prefetch();
-                handle.await;
-            }
-
-            // FP16 refine + hub pinning (best combo)
-            eprintln!("\n=== FP16 Refine + Hub Pinning (pin128, perq-cold) ===");
-            {
-                let pin_pages: Vec<u32> = (0..128u32).collect();
-                let label = "f16+R160-pin128".to_string();
-                let cfg = BenchConfig {
-                    label: label.clone(),
-                    ef: 200, k, prefetch_width: 4,
-                    stall_limit: 0, drain_budget: 0,
-                    adj_inflight: 64, cache_pct,
-                    num_queries, warmup_queries: 0,
-                    ada_ef: false,
-                    clear_per_query: true,
-                };
-                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                let actually_pinned = pool.pin_pages(&pin_pages, &io).await
-                    .expect("pin_pages failed");
-                eprintln!("  pin128: requested=128, actually_pinned={}", actually_pinned);
-                let handle = AdjacencyPool::spawn_prefetch_worker(
-                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                );
-                let result = run_bench_v3_refine_fp16(
-                    &cfg, 160, refine_inflight,
-                    &entry_set, &pool, &io, saq_bench_bank,
-                    &adj_index, &fp16_reader, &query_vecs, &ground_truth,
-                ).await;
-                print_bench_row(&cfg, &result);
-                pool.stop_prefetch();
-                handle.await;
-            }
-
-            // --- Stage 6: Three-stage pipeline (SAQ → int8 filter → FP32 exact) ---
-            eprintln!("\n=== Three-Stage: SAQ → int8 filter → FP32 refine (perq-cold) ===");
-            eprintln!("  R=160 SAQ candidates → int8 filter to top-T → FP32 exact on T");
-            eprintln!("  Expected IO: R×1KB int8 + T×3KB FP32. T < R saves FP32 reads.");
-
-            for &int8_topk in &[120usize, 80, 60, 40] {
-                let label = format!("3stg-R160-T{}", int8_topk);
-                let cfg = BenchConfig {
-                    label: label.clone(),
-                    ef: 200, k, prefetch_width: 4,
-                    stall_limit: 0, drain_budget: 0,
-                    adj_inflight: 64, cache_pct,
-                    num_queries, warmup_queries: 0,
-                    ada_ef: false,
-                    clear_per_query: true,
-                };
-                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
-                let handle = AdjacencyPool::spawn_prefetch_worker(
-                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
-                );
-
-                // Run 3-stage search for each query, collect results
-                let nq = num_queries.min(query_vecs.len());
-                let mut recalls = Vec::with_capacity(nq);
-                let mut latencies_ms = Vec::with_capacity(nq);
-                let mut sum_refine_bytes = 0u64;
-                let mut sum_refine_ns = 0u64;
-                let mut sum_refine_count = 0u64;
-                let wall_start = std::time::Instant::now();
-
-                for i in 0..nq {
-                    pool.pause_prefetch(true);
-                    pool.drain_prefetch();
-                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
-                    while pool.has_loading() {
-                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
-                    }
-                    pool.clear();
-                    pool.pause_prefetch(false);
-
-                    let q = &query_vecs[i];
-                    let mut perf = SearchPerfContext::default();
-                    let t0 = std::time::Instant::now();
-
-                    let results = disk_graph_search_pipe_v3_refine_3stage(
-                        q, &entry_set, k, 200, 160, int8_topk, 4,
-                        0, 0,
-                        &pool, &io, saq_bench_bank, &adj_index,
-                        &int8_reader, &vec_reader,
-                        refine_inflight, &mut perf, PerfLevel::EnableTime,
+                // --- SAQ+refine R=160 warm (cross-query cache benefit) ---
+                {
+                    let label = "SAQ+R160-warm".to_string();
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 10,
+                        ada_ef: false,
+                        clear_per_query: false,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+                    let result = run_bench_v3_refine(
+                        &cfg, 160, refine_inflight,
+                        &entry_set, &pool, &io, saq_bench_bank,
+                        &layout.adj_index, &vec_reader, &query_vecs, &ground_truth,
                     ).await;
-
-                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
-                    recalls.push(recall_at_k(&ids, &ground_truth[i]));
-                    sum_refine_bytes += perf.refine_bytes;
-                    sum_refine_ns += perf.refine_ns;
-                    sum_refine_count += perf.refine_count;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
                 }
 
-                let wall_secs = wall_start.elapsed().as_secs_f64();
-                let nf = nq as f64;
-                let mean_recall = recalls.iter().sum::<f64>() / nf;
-                let qps = nf / wall_secs;
-                let mut sorted_lat = latencies_ms.clone();
-                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let p50 = percentile(&sorted_lat, 50.0);
-                let p99 = percentile(&sorted_lat, 99.0);
-                let ns_to_ms = 1.0 / 1_000_000.0;
+                // --- Stage 3: Hub pinning + SAQ+refine (R=160) ---
+                eprintln!("\n=== Hub Pinning [{}]: SAQ+ref-R160 with pin64/pin128 (perq-cold) ===",
+                    layout.label);
+                for &pin_count in &[64u32, 128u32] {
+                    let pin_pages: Vec<u32> = (0..pin_count).collect();
+                    let label = format!("SAQ+R160-pin{}", pin_count);
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let actually_pinned = pool.pin_pages(&pin_pages, &io).await
+                        .expect("pin_pages failed");
+                    eprintln!("  pin{}: requested={}, actually_pinned={}",
+                        pin_count, pin_count, actually_pinned);
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+                    let result = run_bench_v3_refine(
+                        &cfg, 160, refine_inflight,
+                        &entry_set, &pool, &io, saq_bench_bank,
+                        &layout.adj_index, &vec_reader, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
 
-                eprintln!(
-                    "  {:<18} recall={:.3}  p50={:.1}ms  p99={:.1}ms  QPS={:.1}  ref_ms={:.2}  refine_bytes/q={:.0}KB  refines/q={:.0}",
-                    label, mean_recall, p50, p99, qps,
-                    sum_refine_ns as f64 / nf * ns_to_ms,
-                    sum_refine_bytes as f64 / nf / 1024.0,
-                    sum_refine_count as f64 / nf,
+                // --- Stage 4: Int8 refine ---
+                eprintln!("\n=== Int8 Refine [{}]: SAQ graph → int8 disk refine (perq-cold) ===",
+                    layout.label);
+                eprintln!("  Int8 encoding: round(f32 * 127), {} B/vec (vs {} B/vec FP32) = {:.1}× smaller",
+                    dim, dim * 4, 4.0);
+
+                let int8_path = layout.dir.join("vectors_int8.dat");
+                if !int8_path.exists() {
+                    write_vectors_int8_file(&int8_path, &disk_vectors, dim).unwrap();
+                }
+                let int8_size = std::fs::metadata(&int8_path).unwrap().len();
+                eprintln!("  vectors_int8.dat: {} vectors × {} B = {:.1} MB",
+                    n, dim, int8_size as f64 / 1024.0 / 1024.0);
+
+                let int8_reader = Rc::new(
+                    Int8VectorReader::open(&v3_dir_str, dim, direct_io)
+                        .await
+                        .expect("failed to open Int8VectorReader"),
                 );
 
-                pool.stop_prefetch();
-                handle.await;
-            }
+                for &refine_r in &[120usize, 160, 200] {
+                    let label = format!("i8+ref-R{}", refine_r);
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+                    let result = run_bench_v3_refine_int8(
+                        &cfg, refine_r, refine_inflight,
+                        &entry_set, &pool, &io, saq_bench_bank,
+                        &layout.adj_index, &int8_reader, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // Int8 refine + hub pinning (best combo)
+                eprintln!("\n=== Int8 Refine + Hub Pinning [{}] (pin128, perq-cold) ===",
+                    layout.label);
+                {
+                    let pin_pages: Vec<u32> = (0..128u32).collect();
+                    let label = "i8+R160-pin128".to_string();
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let actually_pinned = pool.pin_pages(&pin_pages, &io).await
+                        .expect("pin_pages failed");
+                    eprintln!("  pin128: requested=128, actually_pinned={}", actually_pinned);
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+                    let result = run_bench_v3_refine_int8(
+                        &cfg, 160, refine_inflight,
+                        &entry_set, &pool, &io, saq_bench_bank,
+                        &layout.adj_index, &int8_reader, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // --- Stage 5: FP16 refine ---
+                eprintln!("\n=== FP16 Refine [{}]: SAQ graph → FP16 disk refine (perq-cold) ===",
+                    layout.label);
+                eprintln!("  FP16 encoding: IEEE 754 half-precision, {} B/vec (vs {} B/vec FP32) = 2× smaller",
+                    dim * 2, dim * 4);
+
+                let fp16_path = layout.dir.join("vectors_fp16.dat");
+                if !fp16_path.exists() {
+                    write_vectors_fp16_file(&fp16_path, &disk_vectors, dim).unwrap();
+                }
+                let fp16_size = std::fs::metadata(&fp16_path).unwrap().len();
+                eprintln!("  vectors_fp16.dat: {} vectors × {} B = {:.1} MB",
+                    n, dim * 2, fp16_size as f64 / 1024.0 / 1024.0);
+
+                let fp16_reader = Rc::new(
+                    Fp16VectorReader::open(&v3_dir_str, dim, direct_io)
+                        .await
+                        .expect("failed to open Fp16VectorReader"),
+                );
+
+                for &refine_r in &[120usize, 160, 200] {
+                    let label = format!("f16+ref-R{}", refine_r);
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+                    let result = run_bench_v3_refine_fp16(
+                        &cfg, refine_r, refine_inflight,
+                        &entry_set, &pool, &io, saq_bench_bank,
+                        &layout.adj_index, &fp16_reader, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // FP16 refine + hub pinning (best combo)
+                eprintln!("\n=== FP16 Refine + Hub Pinning [{}] (pin128, perq-cold) ===",
+                    layout.label);
+                {
+                    let pin_pages: Vec<u32> = (0..128u32).collect();
+                    let label = "f16+R160-pin128".to_string();
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let actually_pinned = pool.pin_pages(&pin_pages, &io).await
+                        .expect("pin_pages failed");
+                    eprintln!("  pin128: requested=128, actually_pinned={}", actually_pinned);
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+                    let result = run_bench_v3_refine_fp16(
+                        &cfg, 160, refine_inflight,
+                        &entry_set, &pool, &io, saq_bench_bank,
+                        &layout.adj_index, &fp16_reader, &query_vecs, &ground_truth,
+                    ).await;
+                    print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // --- Stage 6: Three-stage pipeline (SAQ → int8 filter → FP32 exact) ---
+                eprintln!("\n=== Three-Stage [{}]: SAQ → int8 filter → FP32 refine (perq-cold) ===",
+                    layout.label);
+                eprintln!("  R=160 SAQ candidates → int8 filter to top-T → FP32 exact on T");
+                eprintln!("  Expected IO: R×1KB int8 + T×3KB FP32. T < R saves FP32 reads.");
+
+                for &int8_topk in &[120usize, 80, 60, 40] {
+                    let label = format!("3stg-R160-T{}", int8_topk);
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+
+                    let nq = num_queries.min(query_vecs.len());
+                    let mut recalls = Vec::with_capacity(nq);
+                    let mut latencies_ms = Vec::with_capacity(nq);
+                    let mut sum_refine_bytes = 0u64;
+                    let mut sum_refine_ns = 0u64;
+                    let mut sum_refine_count = 0u64;
+                    let wall_start = std::time::Instant::now();
+
+                    for i in 0..nq {
+                        pool.pause_prefetch(true);
+                        pool.drain_prefetch();
+                        monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                        while pool.has_loading() {
+                            monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                        }
+                        pool.clear();
+                        pool.pause_prefetch(false);
+
+                        let q = &query_vecs[i];
+                        let mut perf = SearchPerfContext::default();
+                        let t0 = std::time::Instant::now();
+
+                        let results = disk_graph_search_pipe_v3_refine_3stage(
+                            q, &entry_set, k, 200, 160, int8_topk, 4,
+                            0, 0,
+                            &pool, &io, saq_bench_bank, &layout.adj_index,
+                            &int8_reader, &vec_reader,
+                            refine_inflight, &mut perf, PerfLevel::EnableTime,
+                        ).await;
+
+                        latencies_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                        recalls.push(recall_at_k(&ids, &ground_truth[i]));
+                        sum_refine_bytes += perf.refine_bytes;
+                        sum_refine_ns += perf.refine_ns;
+                        sum_refine_count += perf.refine_count;
+                    }
+
+                    let wall_secs = wall_start.elapsed().as_secs_f64();
+                    let nf = nq as f64;
+                    let mean_recall = recalls.iter().sum::<f64>() / nf;
+                    let qps = nf / wall_secs;
+                    let mut sorted_lat = latencies_ms.clone();
+                    sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let p50 = percentile(&sorted_lat, 50.0);
+                    let p99 = percentile(&sorted_lat, 99.0);
+                    let ns_to_ms = 1.0 / 1_000_000.0;
+
+                    eprintln!(
+                        "  {:<18} recall={:.3}  p50={:.1}ms  p99={:.1}ms  QPS={:.1}  ref_ms={:.2}  refine_bytes/q={:.0}KB  refines/q={:.0}",
+                        label, mean_recall, p50, p99, qps,
+                        sum_refine_ns as f64 / nf * ns_to_ms,
+                        sum_refine_bytes as f64 / nf / 1024.0,
+                        sum_refine_count as f64 / nf,
+                    );
+
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+            } // end layout loop
         });
     }) {
         eprintln!("Skipped: io_uring not available");

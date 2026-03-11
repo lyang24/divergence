@@ -496,8 +496,8 @@ pub fn heavy_edge_reorder_graph<'a>(
     let mut next_id = 0u32;
     let page_size = BLOCK_SIZE; // 4096
 
-    // Precompute neighbor sets as sorted vecs for deterministic iteration.
-    // Using a flat vec of sorted neighbors avoids HashSet iteration-order dependence.
+    // Precompute sorted neighbor lists and per-VID record sizes (avoids
+    // repeated neighbors_fn calls during the inner loop).
     let nbr_sorted: Vec<Vec<u32>> = (0..n)
         .map(|u| {
             let mut v: Vec<u32> = neighbors_fn(u as u32)
@@ -511,6 +511,17 @@ pub fn heavy_edge_reorder_graph<'a>(
         })
         .collect();
 
+    let rec_sizes: Vec<usize> = (0..n)
+        .map(|u| packed_record_size(neighbors_fn(u as u32).len()))
+        .collect();
+
+    // Stamp array for O(1) "already considered this round" dedup.
+    // Each page-fill round increments `round`; a VID is considered iff
+    // `seen_round[vid] == round`.  Avoids the O(k) linear scan of the
+    // previous `considered.contains()` approach.
+    let mut seen_round: Vec<u32> = vec![0; n];
+    let mut round: u32 = 0;
+
     for &seed in &vids_by_indeg {
         if assigned[seed as usize] {
             continue;
@@ -520,9 +531,8 @@ pub fn heavy_edge_reorder_graph<'a>(
         let mut page_members: Vec<u32> = Vec::new();
         let mut page_used = 0usize;
 
-        let seed_rec = packed_record_size(neighbors_fn(seed).len());
+        let seed_rec = rec_sizes[seed as usize];
         if seed_rec > page_size {
-            // Can't fit even alone — assign and move on
             old_to_new[seed as usize] = next_id;
             next_id += 1;
             assigned[seed as usize] = true;
@@ -542,34 +552,30 @@ pub fn heavy_edge_reorder_graph<'a>(
             let mut best_score = 0u64;
             let mut best_indeg = 0u32;
 
-            // Collect candidate neighbors deterministically:
-            // iterate page_members in order, then their sorted neighbors.
-            // Use `assigned` as implicit dedup (skip already-assigned).
-            // Track "already considered this round" with a small vec to avoid
-            // re-scoring the same candidate from multiple page members.
-            let mut considered = Vec::new();
+            // Bump round counter for O(1) dedup via stamp array.
+            // Guard against u32 overflow on very large graphs.
+            if round == u32::MAX {
+                seen_round.fill(0);
+                round = 1;
+            } else {
+                round += 1;
+            }
 
             for &m in &page_members {
                 for &nbr in &nbr_sorted[m as usize] {
                     if assigned[nbr as usize] {
                         continue;
                     }
-                    // Check if already considered this round
-                    // (considered is sorted by construction since nbr_sorted is sorted
-                    //  and we process page_members in order)
-                    if considered.contains(&nbr) {
+                    if seen_round[nbr as usize] == round {
                         continue;
                     }
-                    considered.push(nbr);
+                    seen_round[nbr as usize] = round;
 
-                    let rec_size = packed_record_size(neighbors_fn(nbr).len());
-                    if page_used + rec_size > page_size {
-                        continue; // won't fit
+                    if page_used + rec_sizes[nbr as usize] > page_size {
+                        continue;
                     }
 
                     // Score = sum of edge weights to page members.
-                    // For each page member m that is a neighbor of cand:
-                    //   w(cand, m) = indeg(cand) + indeg(m)
                     let cand_nbrs = &nbr_sorted[nbr as usize];
                     let mut score = 0u64;
                     for &pm in &page_members {
@@ -578,7 +584,6 @@ pub fn heavy_edge_reorder_graph<'a>(
                         }
                     }
 
-                    // Deterministic tie-break: higher score > higher indeg > lower VID
                     if score > best_score
                         || (score == best_score && indeg[nbr as usize] > best_indeg)
                         || (score == best_score
@@ -593,15 +598,14 @@ pub fn heavy_edge_reorder_graph<'a>(
             }
 
             if best_vid == u32::MAX {
-                break; // No more fitting candidates
+                break;
             }
 
-            let rec_size = packed_record_size(neighbors_fn(best_vid).len());
             old_to_new[best_vid as usize] = next_id;
             next_id += 1;
             assigned[best_vid as usize] = true;
             page_members.push(best_vid);
-            page_used += rec_size;
+            page_used += rec_sizes[best_vid as usize];
         }
     }
 
