@@ -614,8 +614,333 @@ impl VectorReader {
         Ok(f32_slice.to_vec())
     }
 
+    /// Read one FP32 vector from disk and compute cosine distance against `query`
+    /// directly on the aligned IO buffer — avoids allocating a `Vec<f32>` per read.
+    ///
+    /// Returns the cosine distance (1 - cos_sim). `query_norm_sq` = Σ(q_i²).
+    pub async fn read_cosine_distance(
+        &self,
+        vid: u32,
+        query: &[f32],
+        query_norm_sq: f32,
+    ) -> io::Result<f32> {
+        debug_assert_eq!(
+            query.len(),
+            self.dim,
+            "query dim mismatch: query.len={} dim={}",
+            query.len(),
+            self.dim
+        );
+
+        let raw_offset = vid as u64 * self.vec_bytes as u64;
+        let align_offset = raw_offset & !511;
+        let intra_offset = (raw_offset - align_offset) as usize;
+        let total_read = ((intra_offset + self.vec_bytes) + 511) & !511;
+
+        let buf = AlignedBuf::new(total_read);
+        let (result, buf) = self.file.read_at(buf, align_offset).await;
+        let n = result?;
+        if n < intra_offset + self.vec_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short vector read: {} bytes (need {})", n, intra_offset + self.vec_bytes),
+            ));
+        }
+
+        let bytes = buf.as_slice();
+        let vec_bytes = &bytes[intra_offset..intra_offset + self.vec_bytes];
+        debug_assert_eq!(intra_offset & 3, 0, "vector intra_offset must be 4B aligned");
+        debug_assert_eq!(self.vec_bytes & 3, 0, "vec_bytes must be multiple of 4");
+        debug_assert_eq!(
+            (vec_bytes.as_ptr() as usize) & 3,
+            0,
+            "vector pointer must be 4B aligned"
+        );
+        let v = unsafe {
+            std::slice::from_raw_parts(vec_bytes.as_ptr() as *const f32, self.dim)
+        };
+
+        // Compute cosine distance in-place on the IO buffer
+        let mut dot = 0.0f32;
+        let mut norm_b = 0.0f32;
+        for i in 0..self.dim {
+            dot += query[i] * v[i];
+            norm_b += v[i] * v[i];
+        }
+        let denom = (query_norm_sq * norm_b).sqrt();
+        let dist = if denom == 0.0 { 1.0 } else { 1.0 - dot / denom };
+        Ok(dist)
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Int8VectorReader — async reader for int8-quantized vectors
+// ---------------------------------------------------------------------------
+
+/// Async reader for int8-quantized vectors stored on disk (vectors_int8.dat).
+///
+/// Each vector is `dim` bytes (1 byte per dimension) at offset `vid × dim`.
+/// Encoding: round(f32_val * 127.0), clamped to [-127, 127].
+/// For dim=768: 768 bytes/vec vs FP32's 3072 bytes/vec = 4× smaller.
+///
+/// O_DIRECT requires 512-byte aligned reads, handled automatically.
+pub struct Int8VectorReader {
+    file: File,
+    dim: usize,
+    /// Bytes per vector (dim * 1).
+    vec_bytes: usize,
+}
+
+impl Int8VectorReader {
+    pub async fn open(dir: &str, dim: usize, direct_io: bool) -> io::Result<Self> {
+        let path = format!("{}/vectors_int8.dat", dir);
+        let mut opts = monoio::fs::OpenOptions::new();
+        opts.read(true);
+        if direct_io {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        let file = opts.open(&path).await?;
+        Ok(Self { file, dim, vec_bytes: dim })
+    }
+
+    /// Read one int8 vector from disk and compute cosine distance against `query`.
+    ///
+    /// Computes directly on the IO buffer — no heap allocation.
+    /// The 1/127 scale factor cancels in cosine: cos(q, c/127) = dot(q,c) / (||q||·||c||).
+    /// So we work entirely in the integer code domain (no division).
+    ///
+    /// Returns `(cosine_distance, bytes_read)` where bytes_read is the actual
+    /// IO size submitted to the kernel (for honest IO accounting).
+    pub async fn read_cosine_distance(
+        &self,
+        vid: u32,
+        query: &[f32],
+        query_norm_sq: f32,
+    ) -> io::Result<(f32, usize)> {
+        debug_assert_eq!(query.len(), self.dim);
+
+        let raw_offset = vid as u64 * self.vec_bytes as u64;
+        let align_offset = raw_offset & !511;
+        let intra_offset = (raw_offset - align_offset) as usize;
+        let total_read = ((intra_offset + self.vec_bytes) + 511) & !511;
+
+        let buf = AlignedBuf::new(total_read);
+        let (result, buf) = self.file.read_at(buf, align_offset).await;
+        let n = result?;
+        if n < intra_offset + self.vec_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short int8 vector read: {} bytes (need {})", n, intra_offset + self.vec_bytes),
+            ));
+        }
+
+        let bytes = buf.as_slice();
+        let codes = &bytes[intra_offset..intra_offset + self.vec_bytes];
+
+        // Cosine distance using integer codes directly.
+        // cos(q, code/127) = dot(q, code) / (||q|| * ||code||)
+        // The 1/127 cancels: dot(q, code/127) / ||code/127|| = dot(q, code) / ||code||.
+        // query_norm_sq is precomputed as Σ(q_i²) in f32 domain.
+        let mut dot_qc = 0.0f32;
+        let mut norm_c_sq = 0.0f32;
+        for i in 0..self.dim {
+            let ci = codes[i] as i8 as f32;
+            dot_qc += query[i] * ci;
+            norm_c_sq += ci * ci;
+        }
+        let denom = (query_norm_sq * norm_c_sq).sqrt();
+        let dist = if denom == 0.0 { 1.0 } else { 1.0 - dot_qc / denom };
+        Ok((dist, total_read))
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Bytes per vector on disk (= dim for int8).
+    pub fn vec_bytes(&self) -> usize {
+        self.vec_bytes
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP16 cosine distance kernel (F16C + AVX2 / scalar fallback)
+// ---------------------------------------------------------------------------
+
+/// Compute dot(query, fp16_vec) and norm_sq(fp16_vec) in a single pass.
+/// `fp16_bytes`: raw LE bytes of the f16 vector (dim * 2 bytes).
+/// `query`: f32 query vector (dim elements).
+/// Returns (dot_product, norm_b_sq).
+#[inline]
+fn cosine_dot_fp16(fp16_bytes: &[u8], query: &[f32], dim: usize) -> (f32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { cosine_dot_fp16_f16c(fp16_bytes, query, dim) };
+        }
+    }
+    cosine_dot_fp16_scalar(fp16_bytes, query, dim)
+}
+
+fn cosine_dot_fp16_scalar(fp16_bytes: &[u8], query: &[f32], dim: usize) -> (f32, f32) {
+    let mut dot = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..dim {
+        let lo = fp16_bytes[i * 2] as u16;
+        let hi = fp16_bytes[i * 2 + 1] as u16;
+        let half = lo | (hi << 8);
+        let v = divergence_storage::f16_to_f32(half);
+        dot += query[i] * v;
+        norm_b += v * v;
+    }
+    (dot, norm_b)
+}
+
+/// F16C + FMA kernel: VCVTPH2PS converts 8 f16→f32, then FMA for dot+norm.
+/// Processes 8 elements per iteration (256-bit SIMD).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c,avx2,fma")]
+unsafe fn cosine_dot_fp16_f16c(fp16_bytes: &[u8], query: &[f32], dim: usize) -> (f32, f32) {
+    use std::arch::x86_64::*;
+
+    let mut dot_acc = _mm256_setzero_ps();
+    let mut norm_acc = _mm256_setzero_ps();
+
+    let chunks = dim / 8;
+    let fp16_ptr = fp16_bytes.as_ptr() as *const __m128i;
+    let query_ptr = query.as_ptr();
+
+    for i in 0..chunks {
+        // Load 8 × f16 (128 bits) and convert to 8 × f32 (256 bits)
+        let half8 = _mm_loadu_si128(fp16_ptr.add(i));
+        let v8 = _mm256_cvtph_ps(half8);
+
+        // Load 8 × f32 query values
+        let q8 = _mm256_loadu_ps(query_ptr.add(i * 8));
+
+        // dot += q * v, norm += v * v
+        dot_acc = _mm256_fmadd_ps(q8, v8, dot_acc);
+        norm_acc = _mm256_fmadd_ps(v8, v8, norm_acc);
+    }
+
+    // Horizontal sum of 8-wide accumulators
+    let dot_sum = hsum256_ps(dot_acc);
+    let norm_sum = hsum256_ps(norm_acc);
+
+    // Handle remainder (dim % 8)
+    let tail_start = chunks * 8;
+    let mut dot_tail = 0.0f32;
+    let mut norm_tail = 0.0f32;
+    for i in tail_start..dim {
+        let lo = fp16_bytes[i * 2] as u16;
+        let hi = fp16_bytes[i * 2 + 1] as u16;
+        let half = lo | (hi << 8);
+        let v = divergence_storage::f16_to_f32(half);
+        dot_tail += query[i] * v;
+        norm_tail += v * v;
+    }
+
+    (dot_sum + dot_tail, norm_sum + norm_tail)
+}
+
+/// Horizontal sum of __m256 (8 floats → 1 float).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    // v = [a0 a1 a2 a3 | a4 a5 a6 a7]
+    let hi128 = _mm256_extractf128_ps(v, 1); // [a4 a5 a6 a7]
+    let lo128 = _mm256_castps256_ps128(v);    // [a0 a1 a2 a3]
+    let sum128 = _mm_add_ps(lo128, hi128);    // [a0+a4, a1+a5, a2+a6, a3+a7]
+    let shuf = _mm_movehdup_ps(sum128);       // [a1+a5, a1+a5, a3+a7, a3+a7]
+    let sums = _mm_add_ps(sum128, shuf);      // [s01, _, s23, _]
+    let shuf2 = _mm_movehl_ps(sums, sums);   // [s23, _, ...]
+    let final_sum = _mm_add_ss(sums, shuf2);  // [s01+s23]
+    _mm_cvtss_f32(final_sum)
+}
+
+// ---------------------------------------------------------------------------
+// Fp16VectorReader — async reader for half-precision vectors
+// ---------------------------------------------------------------------------
+
+/// Async reader for FP16 vectors stored on disk (vectors_fp16.dat).
+///
+/// Each vector is `dim × 2` bytes at offset `vid × dim × 2`.
+/// FP16 gives ~3 decimal digits of precision — much better than int8 (~2.1).
+/// For dim=768: 1536 bytes/vec vs FP32's 3072 bytes/vec = 2× smaller IO.
+///
+/// O_DIRECT requires 512-byte aligned reads, handled automatically.
+pub struct Fp16VectorReader {
+    file: File,
+    dim: usize,
+    /// Bytes per vector (dim * 2).
+    vec_bytes: usize,
+}
+
+impl Fp16VectorReader {
+    pub async fn open(dir: &str, dim: usize, direct_io: bool) -> io::Result<Self> {
+        let path = format!("{}/vectors_fp16.dat", dir);
+        let mut opts = monoio::fs::OpenOptions::new();
+        opts.read(true);
+        if direct_io {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        let file = opts.open(&path).await?;
+        Ok(Self { file, dim, vec_bytes: dim * 2 })
+    }
+
+    /// Read one FP16 vector from disk and compute cosine distance against `query`.
+    ///
+    /// Converts f16 → f32 on-the-fly and computes cosine distance in-place
+    /// on the IO buffer — no heap allocation per read.
+    ///
+    /// Returns `(cosine_distance, bytes_read)` where bytes_read is the actual
+    /// IO size submitted to the kernel (for honest IO accounting).
+    pub async fn read_cosine_distance(
+        &self,
+        vid: u32,
+        query: &[f32],
+        query_norm_sq: f32,
+    ) -> io::Result<(f32, usize)> {
+        debug_assert_eq!(query.len(), self.dim);
+
+        let raw_offset = vid as u64 * self.vec_bytes as u64;
+        let align_offset = raw_offset & !511;
+        let intra_offset = (raw_offset - align_offset) as usize;
+        let total_read = ((intra_offset + self.vec_bytes) + 511) & !511;
+
+        let buf = AlignedBuf::new(total_read);
+        let (result, buf) = self.file.read_at(buf, align_offset).await;
+        let n = result?;
+        if n < intra_offset + self.vec_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short fp16 vector read: {} bytes (need {})", n, intra_offset + self.vec_bytes),
+            ));
+        }
+
+        let bytes = buf.as_slice();
+        let fp16_bytes = &bytes[intra_offset..intra_offset + self.vec_bytes];
+        debug_assert_eq!(intra_offset & 1, 0, "fp16 intra_offset must be 2B aligned");
+
+        // Compute cosine distance: convert f16→f32 and fused dot+norm
+        let (dot, norm_b) = cosine_dot_fp16(fp16_bytes, query, self.dim);
+        let denom = (query_norm_sq * norm_b).sqrt();
+        let dist = if denom == 0.0 { 1.0 } else { 1.0 - dot / denom };
+        Ok((dist, total_read))
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn vec_bytes(&self) -> usize {
+        self.vec_bytes
     }
 }
 

@@ -1,12 +1,18 @@
 //! 4KB-aligned heap buffer implementing monoio's IoBuf/IoBufMut.
 //!
-//! Required for O_DIRECT IO — both buffer pointer and file offset
-//! must be 4096-aligned. Standard Vec<u8> does not guarantee this.
+//! Required for O_DIRECT IO — buffer pointer, file offset, and read length
+//! must meet the kernel/filesystem alignment rules (typically 512B on NVMe).
+//! Standard `Vec<u8>` does not guarantee suitable alignment.
 
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 
+// 4KB alignment is always safe and also works for 512B-aligned direct IO.
 const ALIGNMENT: usize = 4096;
+// Read length/offset alignment for O_DIRECT (common case). We still allocate
+// with 4KB alignment, but we only round the *size* up to 512 so vector reads
+// can be 1KB/3KB instead of always 4KB.
+const IO_SIZE_ALIGNMENT: usize = 512;
 
 /// 4KB-aligned buffer for O_DIRECT IO.
 ///
@@ -20,12 +26,12 @@ pub struct AlignedBuf {
 }
 
 impl AlignedBuf {
-    /// Allocate a new buffer with at least `size` bytes, rounded up to 4096.
+    /// Allocate a new buffer with at least `size` bytes, rounded up to 512.
     pub fn new(size: usize) -> Self {
         let capacity = round_up(size);
         let layout = Layout::from_size_align(capacity, ALIGNMENT).expect("invalid layout");
 
-        // Safety: layout has non-zero size (round_up guarantees >= 4096)
+        // Safety: layout has non-zero size (round_up guarantees >= 512)
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).expect("allocation failed");
 
@@ -93,8 +99,8 @@ unsafe impl monoio::buf::IoBufMut for AlignedBuf {
 }
 
 fn round_up(size: usize) -> usize {
-    let s = if size == 0 { ALIGNMENT } else { size };
-    (s + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+    let s = if size == 0 { IO_SIZE_ALIGNMENT } else { size };
+    (s + IO_SIZE_ALIGNMENT - 1) & !(IO_SIZE_ALIGNMENT - 1)
 }
 
 #[cfg(test)]
@@ -111,13 +117,13 @@ mod tests {
     #[test]
     fn capacity_rounds_up() {
         let buf = AlignedBuf::new(1);
-        assert_eq!(buf.capacity(), 4096);
+        assert_eq!(buf.capacity(), 512);
 
-        let buf = AlignedBuf::new(4097);
-        assert_eq!(buf.capacity(), 8192);
+        let buf = AlignedBuf::new(513);
+        assert_eq!(buf.capacity(), 1024);
 
         let buf = AlignedBuf::new(0);
-        assert_eq!(buf.capacity(), 4096);
+        assert_eq!(buf.capacity(), 512);
     }
 
     #[test]

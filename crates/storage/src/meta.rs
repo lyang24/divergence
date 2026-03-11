@@ -25,6 +25,10 @@ pub struct IndexMeta {
     /// Number of pages in adjacency_pages.dat (v3 only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_pages: Option<u32>,
+    /// Adjacency reorder strategy used for v3 layout (e.g. "bfs", "heavy_edge").
+    /// Absent for v1/v2 layouts (identity order).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adj_reorder: Option<String>,
 }
 
 fn default_adj_layout_version() -> u32 {

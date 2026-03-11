@@ -57,6 +57,7 @@ impl IndexWriter {
             adj_layout_version: 1,
             pq: None,
             num_pages: None,
+            adj_reorder: None,
         };
         meta.write_to(&self.meta_path())?;
 
@@ -117,6 +118,7 @@ impl IndexWriter {
                 codebook_file: codebook_filename.to_string(),
             }),
             num_pages: None,
+            adj_reorder: None,
         };
         meta.write_to(&self.meta_path())?;
 
@@ -143,6 +145,7 @@ impl IndexWriter {
         vectors_data: &[f32],
         neighbors_fn: impl Fn(u32) -> &'a [u32],
         reorder: &[u32],
+        adj_reorder_label: &str,
     ) -> io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
 
@@ -167,6 +170,7 @@ impl IndexWriter {
             adj_layout_version: 3,
             pq: None,
             num_pages: Some(num_pages),
+            adj_reorder: Some(adj_reorder_label.to_string()),
         };
         meta.write_to(&self.meta_path())?;
 

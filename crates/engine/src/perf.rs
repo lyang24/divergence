@@ -97,6 +97,10 @@ pub struct SearchPerfContext {
     /// Expansion count at which search stopped (0 if not stopped early).
     pub expansions_at_stop: u64,
 
+    // --- Page-aware scheduling diagnostics (always on) ---
+    /// Times a non-top-1 candidate was chosen because its page was resident.
+    pub page_sched_hits: u64,
+
     // --- PQ gating diagnostics (always on) ---
     /// Total neighbors scored with PQ approximate distance.
     pub pq_candidates_scored: u64,
@@ -115,6 +119,8 @@ pub struct SearchPerfContext {
     pub dist_ns: u64,
     /// Wall-clock nanoseconds for exact-distance refinement phase.
     pub refine_ns: u64,
+    /// Total bytes actually submitted to kernel for refine reads (honest IO accounting).
+    pub refine_bytes: u64,
     /// Wall-clock nanoseconds for entire search (set by SearchGuard on drop).
     pub total_ns: u64,
 }
@@ -792,7 +798,9 @@ mod tests {
             compute_ns: 300_000,
             dist_ns: 250_000,
             refine_ns: 0,
+            refine_bytes: 0,
             total_ns: 550_000,
+            page_sched_hits: 0,
         };
         let s = format!("{}", ctx);
         assert!(s.contains("blocks=50"));

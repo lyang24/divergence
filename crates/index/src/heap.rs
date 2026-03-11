@@ -184,6 +184,68 @@ impl CandidateHeap {
         n
     }
 
+    /// Pop the best candidate, preferring one whose page is resident in cache.
+    ///
+    /// Looks at the top `b` nearest candidates. If any have a resident page
+    /// (as determined by `is_preferred`), returns the nearest among those.
+    /// Otherwise returns the overall nearest (same as `pop()`).
+    ///
+    /// Returns `(candidate, was_preferred)` where `was_preferred` is true if the
+    /// chosen candidate was selected because it was preferred (not purely by distance).
+    ///
+    /// O(b log n) — negligible for b <= 16 in an IO-bound search loop.
+    pub fn pop_preferred(
+        &mut self,
+        b: usize,
+        is_preferred: impl Fn(u32) -> bool, // vid -> is this candidate preferred?
+    ) -> Option<(ScoredId, bool)> {
+        if self.data.is_empty() {
+            return None;
+        }
+        if b <= 1 {
+            return self.pop().map(|s| (s, false));
+        }
+
+        // Pop top-b candidates
+        let b = b.min(self.data.len());
+        let mut popped = Vec::with_capacity(b);
+        for _ in 0..b {
+            if let Some(item) = self.pop() {
+                popped.push(item);
+            } else {
+                break;
+            }
+        }
+
+        // Find best-distance among preferred candidates
+        let mut best_preferred_idx: Option<usize> = None;
+        for (i, item) in popped.iter().enumerate() {
+            if is_preferred(item.id.0) {
+                if best_preferred_idx.is_none()
+                    || item.distance < popped[best_preferred_idx.unwrap()].distance
+                {
+                    best_preferred_idx = Some(i);
+                }
+            }
+        }
+
+        let (chosen_idx, was_preferred) = match best_preferred_idx {
+            Some(idx) => (idx, idx != 0), // idx==0 means it was already the best
+            None => (0, false),           // no preferred → take the best (first popped)
+        };
+
+        let chosen = popped[chosen_idx];
+
+        // Push back all except the chosen
+        for (i, item) in popped.into_iter().enumerate() {
+            if i != chosen_idx {
+                self.push(item);
+            }
+        }
+
+        Some((chosen, was_preferred))
+    }
+
     /// Pop the nearest candidate. O(log n).
     pub fn pop(&mut self) -> Option<ScoredId> {
         if self.data.is_empty() {

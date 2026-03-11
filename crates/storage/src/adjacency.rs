@@ -408,6 +408,351 @@ pub fn bfs_reorder_graph<'a>(
     old_to_new
 }
 
+/// Neighbor-run BFS reorder: like `bfs_reorder_graph`, but when visiting node u,
+/// eagerly assigns u's unassigned neighbors before continuing BFS. This creates
+/// runs of `[u, nbr1, nbr2, ...]` in the new-VID space so the writer's greedy
+/// page packer naturally co-locates them on the same 4KB page.
+///
+/// Same contract as `bfs_reorder_graph`: returns `old_to_new` mapping.
+pub fn neighbor_run_reorder_graph<'a>(
+    n: usize,
+    entry_set: &[u32],
+    neighbors_fn: impl Fn(u32) -> &'a [u32],
+) -> Vec<u32> {
+    let mut old_to_new = vec![u32::MAX; n];
+    let mut queue = std::collections::VecDeque::new();
+    let mut next_id = 0u32;
+
+    // Seed BFS from entry points
+    for &ep in entry_set {
+        let v = ep as usize;
+        if v < n && old_to_new[v] == u32::MAX {
+            old_to_new[v] = next_id;
+            next_id += 1;
+            queue.push_back(v);
+        }
+    }
+
+    while let Some(v) = queue.pop_front() {
+        // Eagerly assign v's unassigned neighbors so they get consecutive new VIDs.
+        // This creates neighbor-runs: the writer will pack them onto the same page.
+        for &nbr in neighbors_fn(v as u32) {
+            let ni = nbr as usize;
+            if ni < n && old_to_new[ni] == u32::MAX {
+                old_to_new[ni] = next_id;
+                next_id += 1;
+                queue.push_back(ni);
+            }
+        }
+    }
+
+    // Unreachable nodes
+    for i in 0..n {
+        if old_to_new[i] == u32::MAX {
+            old_to_new[i] = next_id;
+            next_id += 1;
+        }
+    }
+
+    old_to_new
+}
+
+/// Heavy-edge page packing (MARGO-style): seed pages with high-in-degree nodes,
+/// greedily fill from graph neighbors maximizing `indeg(u) + indeg(v)` edge weight.
+///
+/// Unlike the simple edge-walk variant, this uses "seed + greedy neighbor fill" to
+/// produce denser pages. Only graph neighbors of existing page members are considered
+/// (MARGO's "don't add non-neighbors" rule).
+///
+/// Returns `old_to_new` mapping (same contract as `bfs_reorder_graph`).
+pub fn heavy_edge_reorder_graph<'a>(
+    n: usize,
+    neighbors_fn: impl Fn(u32) -> &'a [u32],
+) -> Vec<u32> {
+    if n == 0 {
+        return vec![];
+    }
+
+    // 1. Compute in-degrees
+    let mut indeg = vec![0u32; n];
+    for u in 0..n {
+        for &v in neighbors_fn(u as u32) {
+            if (v as usize) < n {
+                indeg[v as usize] += 1;
+            }
+        }
+    }
+
+    // 2. Sort VIDs by in-degree descending, break ties by VID ascending
+    //    (deterministic: no hash-order dependence)
+    let mut vids_by_indeg: Vec<u32> = (0..n as u32).collect();
+    vids_by_indeg.sort_unstable_by(|&a, &b| {
+        indeg[b as usize].cmp(&indeg[a as usize]).then(a.cmp(&b))
+    });
+
+    // 3. Greedy page packing: seed + neighbor fill
+    let mut old_to_new = vec![u32::MAX; n];
+    let mut assigned = vec![false; n];
+    let mut next_id = 0u32;
+    let page_size = BLOCK_SIZE; // 4096
+
+    // Precompute neighbor sets as sorted vecs for deterministic iteration.
+    // Using a flat vec of sorted neighbors avoids HashSet iteration-order dependence.
+    let nbr_sorted: Vec<Vec<u32>> = (0..n)
+        .map(|u| {
+            let mut v: Vec<u32> = neighbors_fn(u as u32)
+                .iter()
+                .copied()
+                .filter(|&vid| (vid as usize) < n)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        })
+        .collect();
+
+    for &seed in &vids_by_indeg {
+        if assigned[seed as usize] {
+            continue;
+        }
+
+        // Start a new page with this seed
+        let mut page_members: Vec<u32> = Vec::new();
+        let mut page_used = 0usize;
+
+        let seed_rec = packed_record_size(neighbors_fn(seed).len());
+        if seed_rec > page_size {
+            // Can't fit even alone — assign and move on
+            old_to_new[seed as usize] = next_id;
+            next_id += 1;
+            assigned[seed as usize] = true;
+            continue;
+        }
+        old_to_new[seed as usize] = next_id;
+        next_id += 1;
+        assigned[seed as usize] = true;
+        page_members.push(seed);
+        page_used += seed_rec;
+
+        // Greedily fill: among unassigned graph neighbors of page members,
+        // pick the one with highest edge weight (indeg sum) to page members.
+        // Ties broken by (higher indeg, lower VID) for determinism.
+        loop {
+            let mut best_vid = u32::MAX;
+            let mut best_score = 0u64;
+            let mut best_indeg = 0u32;
+
+            // Collect candidate neighbors deterministically:
+            // iterate page_members in order, then their sorted neighbors.
+            // Use `assigned` as implicit dedup (skip already-assigned).
+            // Track "already considered this round" with a small vec to avoid
+            // re-scoring the same candidate from multiple page members.
+            let mut considered = Vec::new();
+
+            for &m in &page_members {
+                for &nbr in &nbr_sorted[m as usize] {
+                    if assigned[nbr as usize] {
+                        continue;
+                    }
+                    // Check if already considered this round
+                    // (considered is sorted by construction since nbr_sorted is sorted
+                    //  and we process page_members in order)
+                    if considered.contains(&nbr) {
+                        continue;
+                    }
+                    considered.push(nbr);
+
+                    let rec_size = packed_record_size(neighbors_fn(nbr).len());
+                    if page_used + rec_size > page_size {
+                        continue; // won't fit
+                    }
+
+                    // Score = sum of edge weights to page members.
+                    // For each page member m that is a neighbor of cand:
+                    //   w(cand, m) = indeg(cand) + indeg(m)
+                    let cand_nbrs = &nbr_sorted[nbr as usize];
+                    let mut score = 0u64;
+                    for &pm in &page_members {
+                        if cand_nbrs.binary_search(&pm).is_ok() {
+                            score += (indeg[nbr as usize] + indeg[pm as usize]) as u64;
+                        }
+                    }
+
+                    // Deterministic tie-break: higher score > higher indeg > lower VID
+                    if score > best_score
+                        || (score == best_score && indeg[nbr as usize] > best_indeg)
+                        || (score == best_score
+                            && indeg[nbr as usize] == best_indeg
+                            && nbr < best_vid)
+                    {
+                        best_score = score;
+                        best_vid = nbr;
+                        best_indeg = indeg[nbr as usize];
+                    }
+                }
+            }
+
+            if best_vid == u32::MAX {
+                break; // No more fitting candidates
+            }
+
+            let rec_size = packed_record_size(neighbors_fn(best_vid).len());
+            old_to_new[best_vid as usize] = next_id;
+            next_id += 1;
+            assigned[best_vid as usize] = true;
+            page_members.push(best_vid);
+            page_used += rec_size;
+        }
+    }
+
+    // Remaining unassigned nodes (shouldn't happen unless graph is disconnected)
+    for i in 0..n {
+        if old_to_new[i] == u32::MAX {
+            old_to_new[i] = next_id;
+            next_id += 1;
+        }
+    }
+
+    old_to_new
+}
+
+/// Byte size of one adjacency record in v3 packed format.
+/// 2 bytes (degree u16) + 4 bytes per neighbor VID (u32).
+/// Used by both the writer and the TWPP packer for consistent sizing.
+#[inline]
+pub fn packed_record_size(degree: usize) -> usize {
+    2 + degree * 4
+}
+
+/// TWPP (Trace-Weighted Page Packing) reorder.
+///
+/// Produces an `old_to_new` VID permutation that co-locates frequently
+/// co-expanded VIDs on the same 4KB page. Uses trace-collected co-expansion
+/// weights from actual search queries to determine which VIDs benefit most
+/// from sharing a page.
+///
+/// Algorithm:
+/// 1. Sort VIDs by expansion count (most-expanded = best page seed)
+/// 2. For each unassigned seed, start a new page
+/// 3. Greedily fill the page with the unassigned neighbor that has the
+///    highest total co-expansion weight with already-placed page members
+/// 4. Remaining unassigned VIDs (never expanded) get sequential assignment
+///
+/// Returns `old_to_new` mapping (same contract as `bfs_reorder_graph`).
+pub fn twpp_reorder_graph<'a>(
+    n: usize,
+    neighbors_fn: impl Fn(u32) -> &'a [u32],
+    co_expand: &std::collections::HashMap<(u32, u32), u32>,
+    node_counts: &std::collections::HashMap<u32, u32>,
+) -> Vec<u32> {
+    use std::collections::HashSet;
+
+    // Pre-compute record sizes for all VIDs
+    let mut record_sizes = Vec::with_capacity(n);
+    for vid in 0..n {
+        let degree = neighbors_fn(vid as u32).len();
+        record_sizes.push(packed_record_size(degree));
+    }
+
+    // Sort VIDs by expansion count descending (seeds)
+    let mut seed_order: Vec<u32> = (0..n as u32).collect();
+    seed_order.sort_unstable_by(|&a, &b| {
+        let ca = node_counts.get(&a).copied().unwrap_or(0);
+        let cb = node_counts.get(&b).copied().unwrap_or(0);
+        cb.cmp(&ca)
+    });
+
+    let mut assigned = vec![false; n];
+    let mut old_to_new = vec![u32::MAX; n];
+    let mut next_id = 0u32;
+
+    // Helper: look up co-expand weight between two VIDs
+    let weight = |a: u32, b: u32| -> u32 {
+        let key = if a <= b { (a, b) } else { (b, a) };
+        co_expand.get(&key).copied().unwrap_or(0)
+    };
+
+    for &seed in &seed_order {
+        let si = seed as usize;
+        if assigned[si] {
+            continue;
+        }
+        if record_sizes[si] > BLOCK_SIZE {
+            // Solo page for enormous records (shouldn't happen in practice)
+            old_to_new[si] = next_id;
+            next_id += 1;
+            assigned[si] = true;
+            continue;
+        }
+
+        // Start a new page
+        let mut page_budget = BLOCK_SIZE;
+        let mut page_members: Vec<u32> = Vec::new();
+
+        // Place seed
+        old_to_new[si] = next_id;
+        next_id += 1;
+        assigned[si] = true;
+        page_budget -= record_sizes[si];
+        page_members.push(seed);
+
+        // Greedy fill: pick best unassigned neighbor of any page member
+        loop {
+            let mut best_vid: Option<u32> = None;
+            let mut best_score: u32 = 0;
+            let mut best_node_count: u32 = 0;
+
+            // Collect candidate set: unassigned graph neighbors of page members
+            let mut candidates = HashSet::new();
+            for &member in &page_members {
+                for &nbr in neighbors_fn(member) {
+                    let ni = nbr as usize;
+                    if ni < n && !assigned[ni] && record_sizes[ni] <= page_budget {
+                        candidates.insert(nbr);
+                    }
+                }
+            }
+
+            for &cand in &candidates {
+                // Score = sum of co-expand weights to all placed members
+                let mut score = 0u32;
+                for &member in &page_members {
+                    score += weight(cand, member);
+                }
+                let nc = node_counts.get(&cand).copied().unwrap_or(0);
+                if score > best_score || (score == best_score && nc > best_node_count) {
+                    best_vid = Some(cand);
+                    best_score = score;
+                    best_node_count = nc;
+                }
+            }
+
+            match best_vid {
+                Some(vid) => {
+                    let vi = vid as usize;
+                    old_to_new[vi] = next_id;
+                    next_id += 1;
+                    assigned[vi] = true;
+                    page_budget -= record_sizes[vi];
+                    page_members.push(vid);
+                }
+                None => break,
+            }
+        }
+    }
+
+    // Fallback: assign remaining unassigned nodes sequentially
+    for vid in 0..n {
+        if !assigned[vid] {
+            old_to_new[vid] = next_id;
+            next_id += 1;
+        }
+    }
+
+    debug_assert_eq!(next_id as usize, n, "TWPP permutation size mismatch");
+    old_to_new
+}
+
 /// Write v3 page-packed adjacency files.
 ///
 /// Produces:

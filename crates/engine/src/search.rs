@@ -5,6 +5,7 @@
 //! a coroutine suspension point — monoio services other queries while
 //! the NVMe read is in flight.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use divergence_core::distance::VectorBank;
@@ -16,6 +17,54 @@ use divergence_storage::{decode_adj_block, decode_adj_block_view, page_record_vi
 use crate::cache::AdjacencyPool;
 use crate::io::IoDriver;
 use crate::perf::{PerfLevel, SearchPerfContext};
+
+// ---------------------------------------------------------------------------
+// TraceRecorder — records co-expansion pairs for TWPP layout optimization
+// ---------------------------------------------------------------------------
+
+/// Collects co-expansion edge weights during search for TWPP page packing.
+///
+/// Records (parent, child) pairs when both VIDs are expanded in the same query.
+/// Parent = the VID whose expansion pushed child into the candidate heap.
+/// Co-located parents and children on the same page saves one IO per co-expansion.
+///
+/// Weights are stored with symmetric keys: `(min(u,v), max(u,v))` to avoid
+/// double-counting. Per-query, the recorder also tracks which VIDs were expanded
+/// (for seeding the packer with high-traffic hubs).
+pub struct TraceRecorder {
+    /// Co-expansion pair weights: (min(u,v), max(u,v)) → count.
+    pub co_expand: HashMap<(u32, u32), u32>,
+    /// Node expansion counts: vid → total expansions across all queries.
+    pub node_counts: HashMap<u32, u32>,
+}
+
+impl TraceRecorder {
+    pub fn new() -> Self {
+        Self {
+            co_expand: HashMap::new(),
+            node_counts: HashMap::new(),
+        }
+    }
+
+    /// Pre-allocate for expected number of unique VIDs and edges.
+    pub fn with_capacity(nodes: usize, edges: usize) -> Self {
+        Self {
+            co_expand: HashMap::with_capacity(edges),
+            node_counts: HashMap::with_capacity(nodes),
+        }
+    }
+
+    #[inline]
+    pub fn record_expansion(&mut self, vid: u32) {
+        *self.node_counts.entry(vid).or_insert(0) += 1;
+    }
+
+    #[inline]
+    pub fn record_co_expand(&mut self, parent: u32, child: u32) {
+        let key = if parent <= child { (parent, child) } else { (child, parent) };
+        *self.co_expand.entry(key).or_insert(0) += 1;
+    }
+}
 
 /// Async beam search on disk-resident adjacency graph.
 ///
@@ -660,12 +709,88 @@ pub async fn disk_graph_search_pipe_v3(
     prefetch_window: usize,
     stall_limit: u32,
     drain_budget: u32,
-    pool: &AdjacencyPool,          // caches pages (key = page_id)
-    io: &IoDriver,                 // opened on adjacency_pages.dat
+    pool: &AdjacencyPool,
+    io: &IoDriver,
     bank: &dyn VectorBank,
-    adj_index: &[AdjIndexEntry],   // DRAM-resident
+    adj_index: &[AdjIndexEntry],
     perf: &mut SearchPerfContext,
     level: PerfLevel,
+) -> Vec<ScoredId> {
+    disk_graph_search_pipe_v3_inner(
+        query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
+        pool, io, bank, adj_index, perf, level, None, 0,
+    ).await
+}
+
+/// Traced variant of v3 search — records co-expansion pairs for TWPP.
+/// The trace is observational only: search behavior is identical to the untraced version.
+pub async fn disk_graph_search_pipe_v3_traced(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+    trace: &mut TraceRecorder,
+) -> Vec<ScoredId> {
+    disk_graph_search_pipe_v3_inner(
+        query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
+        pool, io, bank, adj_index, perf, level, Some(trace), 0,
+    ).await
+}
+
+/// Page-aware scheduling variant of v3 search.
+///
+/// Among the top `page_sched_b` candidates in the heap, prefers the one whose page
+/// is already resident in cache. This reduces physical reads by expanding cache-hot
+/// candidates first, at the cost of a bounded deviation from pure distance order.
+///
+/// `page_sched_b = 0` disables scheduling (same as `disk_graph_search_pipe_v3`).
+pub async fn disk_graph_search_pipe_v3_pagesched(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+    page_sched_b: usize,
+) -> Vec<ScoredId> {
+    disk_graph_search_pipe_v3_inner(
+        query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
+        pool, io, bank, adj_index, perf, level, None, page_sched_b,
+    ).await
+}
+
+async fn disk_graph_search_pipe_v3_inner(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+    mut trace: Option<&mut TraceRecorder>,
+    page_sched_b: usize,
 ) -> Vec<ScoredId> {
     let timing = level >= PerfLevel::EnableTime;
 
@@ -683,6 +808,13 @@ pub async fn disk_graph_search_pipe_v3(
 
     let mut visited = vec![false; num_vectors];
     let mut entered_at = vec![u32::MAX; num_vectors];
+    // parent_of[vid] = the VID whose expansion pushed this vid into the heap.
+    // Used by trace to record co-expansion pairs.
+    let mut parent_of = if trace.is_some() {
+        vec![u32::MAX; num_vectors]
+    } else {
+        Vec::new() // zero alloc when not tracing
+    };
 
     let cache_before = pool.stats();
 
@@ -710,7 +842,27 @@ pub async fn disk_graph_search_pipe_v3(
     let mut prev_furthest: f32 = f32::MAX;
     let mut drain_remaining: u32 = 0;
 
-    while let Some(candidate) = candidates.pop() {
+    loop {
+        // Page-aware scheduling: among top-B candidates, prefer one whose page is resident.
+        let (candidate, was_preferred) = if page_sched_b > 1 {
+            match candidates.pop_preferred(page_sched_b, |vid| {
+                let idx = vid as usize;
+                if idx < num_vectors {
+                    pool.is_resident(adj_index[idx].page_id)
+                } else {
+                    false
+                }
+            }) {
+                Some(pair) => pair,
+                None => break,
+            }
+        } else {
+            match candidates.pop() {
+                Some(c) => (c, false),
+                None => break,
+            }
+        };
+
         if let Some(furthest) = nearest.furthest() {
             if candidate.distance > furthest.distance {
                 break;
@@ -725,8 +877,20 @@ pub async fn disk_graph_search_pipe_v3(
         let page_id = entry.page_id;
 
         perf.expansions += 1;
-        perf.blocks_read += 1; // expansions count; IO is reflected by pool hit/miss deltas
+        perf.blocks_read += 1;
+        if was_preferred {
+            perf.page_sched_hits += 1;
+        }
         let expansion_num = perf.expansions;
+
+        // Trace: record expansion + co-expansion with parent
+        if let Some(ref mut tr) = trace {
+            tr.record_expansion(vid as u32);
+            let parent = parent_of[vid];
+            if parent != u32::MAX {
+                tr.record_co_expand(parent, vid as u32);
+            }
+        }
 
         // Prefetch upcoming pages by looking at upcoming candidate VIDs.
         if prefetch_window > 0 {
@@ -814,6 +978,10 @@ pub async fn disk_graph_search_pipe_v3(
                 added_this_expansion += 1;
                 if entered_at[nbr_idx] == u32::MAX {
                     entered_at[nbr_idx] = expansion_num as u32;
+                }
+                // Trace: record parent of this newly-pushed neighbor
+                if !parent_of.is_empty() && parent_of[nbr_idx] == u32::MAX {
+                    parent_of[nbr_idx] = vid as u32;
                 }
             }
         }
@@ -1229,6 +1397,7 @@ pub async fn disk_graph_search_pipe_v3_refine(
     let query_rc = Rc::new(query.to_vec());
 
     // Parallel batch reads bounded by refine_inflight.
+    // No `Vec<f32>` per-candidate allocation: read_cosine_distance computes directly on the IO buffer.
     let mut refined = Vec::with_capacity(candidates.len());
 
     for batch in candidates.chunks(refine_inflight) {
@@ -1238,14 +1407,8 @@ pub async fn disk_graph_search_pipe_v3_refine(
             let vr = Rc::clone(vec_reader);
             let q = Rc::clone(&query_rc);
             let handle = monoio::spawn(async move {
-                match vr.read_vector(vid).await {
-                    Ok(vec_data) => {
-                        let dot: f32 = q.iter().zip(vec_data.iter()).map(|(&a, &b)| a * b).sum();
-                        let norm_b: f32 = vec_data.iter().map(|&x| x * x).sum();
-                        let denom = (norm_a * norm_b).sqrt();
-                        let dist = if denom == 0.0 { 1.0 } else { 1.0 - dot / denom };
-                        ScoredId { distance: dist, id: c.id }
-                    }
+                match vr.read_cosine_distance(vid, &q, norm_a).await {
+                    Ok(dist) => ScoredId { distance: dist, id: c.id },
                     Err(_) => c,
                 }
             });
@@ -1267,4 +1430,263 @@ pub async fn disk_graph_search_pipe_v3_refine(
     refined.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
     refined.truncate(k);
     refined
+}
+
+/// Two-stage v4 search with int8-quantized refine vectors on disk.
+///
+/// Same as `disk_graph_search_pipe_v3_refine` but reads int8 vectors (768 bytes/vec
+/// instead of 3072 bytes/vec for dim=768), giving ~3× fewer IO bytes per refine read.
+/// Int8 encoding: round(f32 * 127), cosine distance computed directly on int8 codes.
+/// Tracks actual IO bytes submitted (via read_at return) for honest accounting.
+pub async fn disk_graph_search_pipe_v3_refine_int8(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    refine_r: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    cheap_bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    vec_reader: &std::rc::Rc<crate::io::Int8VectorReader>,
+    refine_inflight: usize,
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+) -> Vec<ScoredId> {
+    use std::rc::Rc;
+
+    // Stage 1: proxy graph traversal
+    let candidates = disk_graph_search_pipe_v3(
+        query, entry_set, refine_r, ef, prefetch_window,
+        stall_limit, drain_budget, pool, io, cheap_bank, adj_index, perf, level,
+    )
+    .await;
+
+    // Stage 2: parallel int8 vector reads + cosine rescore
+    let timing = level >= PerfLevel::EnableTime;
+    let refine_start = if timing { Some(Instant::now()) } else { None };
+
+    let norm_a: f32 = query.iter().map(|&x| x * x).sum();
+    let query_rc = Rc::new(query.to_vec());
+    let mut refined = Vec::with_capacity(candidates.len());
+    let mut total_refine_bytes = 0u64;
+
+    for batch in candidates.chunks(refine_inflight) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for &c in batch {
+            let vid = c.id.0;
+            let vr = Rc::clone(vec_reader);
+            let q = Rc::clone(&query_rc);
+            let handle = monoio::spawn(async move {
+                match vr.read_cosine_distance(vid, &q, norm_a).await {
+                    Ok((dist, bytes_read)) => (ScoredId { distance: dist, id: c.id }, bytes_read),
+                    Err(_) => (c, 0),
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            let (scored, bytes) = h.await;
+            refined.push(scored);
+            total_refine_bytes += bytes as u64;
+        }
+    }
+
+    perf.refine_count = refined.len() as u64;
+    perf.refine_bytes = total_refine_bytes;
+
+    if let Some(start) = refine_start {
+        perf.refine_ns += start.elapsed().as_nanos() as u64;
+    }
+
+    refined.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+    refined.truncate(k);
+    refined
+}
+
+/// Two-stage search with FP16 refine vectors on disk.
+///
+/// Same structure as `disk_graph_search_pipe_v3_refine` but reads FP16 vectors
+/// (dim×2 bytes/vec = 1536 bytes for dim=768) giving 2× fewer IO bytes per refine.
+/// FP16 has ~3 decimal digits of precision — much better than int8 (~2.1).
+/// Tracks actual IO bytes submitted for honest accounting.
+pub async fn disk_graph_search_pipe_v3_refine_fp16(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    refine_r: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    cheap_bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    fp16_reader: &std::rc::Rc<crate::io::Fp16VectorReader>,
+    refine_inflight: usize,
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+) -> Vec<ScoredId> {
+    use std::rc::Rc;
+
+    // Stage 1: proxy graph traversal
+    let candidates = disk_graph_search_pipe_v3(
+        query, entry_set, refine_r, ef, prefetch_window,
+        stall_limit, drain_budget, pool, io, cheap_bank, adj_index, perf, level,
+    )
+    .await;
+
+    // Stage 2: parallel FP16 vector reads + cosine rescore
+    let timing = level >= PerfLevel::EnableTime;
+    let refine_start = if timing { Some(Instant::now()) } else { None };
+
+    let norm_a: f32 = query.iter().map(|&x| x * x).sum();
+    let query_rc = Rc::new(query.to_vec());
+    let mut refined = Vec::with_capacity(candidates.len());
+    let mut total_refine_bytes = 0u64;
+
+    for batch in candidates.chunks(refine_inflight) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for &c in batch {
+            let vid = c.id.0;
+            let vr = Rc::clone(fp16_reader);
+            let q = Rc::clone(&query_rc);
+            let handle = monoio::spawn(async move {
+                match vr.read_cosine_distance(vid, &q, norm_a).await {
+                    Ok((dist, bytes_read)) => (ScoredId { distance: dist, id: c.id }, bytes_read),
+                    Err(_) => (c, 0),
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            let (scored, bytes) = h.await;
+            refined.push(scored);
+            total_refine_bytes += bytes as u64;
+        }
+    }
+
+    perf.refine_count = refined.len() as u64;
+    perf.refine_bytes = total_refine_bytes;
+
+    if let Some(start) = refine_start {
+        perf.refine_ns += start.elapsed().as_nanos() as u64;
+    }
+
+    refined.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+    refined.truncate(k);
+    refined
+}
+
+/// Three-stage pipeline: SAQ proxy → int8 filter → FP32 exact refine.
+///
+/// Stage 1: SAQ graph traversal (DRAM) → top-R candidates
+/// Stage 2: Int8 refine (disk, 1KB/vec) → top-`int8_topk` candidates (cheap filter)
+/// Stage 3: FP32 refine (disk, 3KB/vec) → top-k exact re-ranking
+///
+/// This recovers FP32 recall while reading most refine vectors as int8 (3× cheaper).
+/// Expected IO at R=160, int8_topk=40: 160KB int8 + 120KB FP32 = 280KB vs 480KB FP32-only.
+pub async fn disk_graph_search_pipe_v3_refine_3stage(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    refine_r: usize,
+    int8_topk: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    cheap_bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    int8_reader: &std::rc::Rc<crate::io::Int8VectorReader>,
+    fp32_reader: &std::rc::Rc<crate::io::VectorReader>,
+    refine_inflight: usize,
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+) -> Vec<ScoredId> {
+    use std::rc::Rc;
+
+    // Stage 1: SAQ proxy graph traversal
+    let candidates = disk_graph_search_pipe_v3(
+        query, entry_set, refine_r, ef, prefetch_window,
+        stall_limit, drain_budget, pool, io, cheap_bank, adj_index, perf, level,
+    )
+    .await;
+
+    let timing = level >= PerfLevel::EnableTime;
+    let refine_start = if timing { Some(Instant::now()) } else { None };
+
+    let norm_a: f32 = query.iter().map(|&x| x * x).sum();
+    let query_rc = Rc::new(query.to_vec());
+
+    // Stage 2: Int8 filter — read all R candidates as int8, keep top int8_topk
+    let mut int8_scored = Vec::with_capacity(candidates.len());
+    let mut total_refine_bytes = 0u64;
+
+    for batch in candidates.chunks(refine_inflight) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for &c in batch {
+            let vid = c.id.0;
+            let vr = Rc::clone(int8_reader);
+            let q = Rc::clone(&query_rc);
+            let handle = monoio::spawn(async move {
+                match vr.read_cosine_distance(vid, &q, norm_a).await {
+                    Ok((dist, bytes)) => (ScoredId { distance: dist, id: c.id }, bytes),
+                    Err(_) => (c, 0),
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            let (scored, bytes) = h.await;
+            int8_scored.push(scored);
+            total_refine_bytes += bytes as u64;
+        }
+    }
+
+    // Sort by int8 distance, keep top int8_topk for FP32 re-ranking
+    int8_scored.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+    int8_scored.truncate(int8_topk);
+
+    // Stage 3: FP32 exact refine on the int8-filtered candidates
+    let mut fp32_refined = Vec::with_capacity(int8_scored.len());
+    let fp32_bytes_per_vec = fp32_reader.dim() * 4;
+
+    for batch in int8_scored.chunks(refine_inflight) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for &c in batch {
+            let vid = c.id.0;
+            let vr = Rc::clone(fp32_reader);
+            let q = Rc::clone(&query_rc);
+            let handle = monoio::spawn(async move {
+                match vr.read_cosine_distance(vid, &q, norm_a).await {
+                    Ok(dist) => ScoredId { distance: dist, id: c.id },
+                    Err(_) => c,
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            fp32_refined.push(h.await);
+        }
+    }
+
+    perf.refine_count = (candidates.len() + int8_topk) as u64;
+    // Honest bytes: int8 measured + FP32 estimated from vec dimensions
+    perf.refine_bytes = total_refine_bytes
+        + (int8_topk as u64 * ((fp32_bytes_per_vec as u64 + 511) & !511));
+
+    if let Some(start) = refine_start {
+        perf.refine_ns += start.elapsed().as_nanos() as u64;
+    }
+
+    fp32_refined.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+    fp32_refined.truncate(k);
+    fp32_refined
 }

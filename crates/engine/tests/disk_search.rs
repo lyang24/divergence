@@ -14,14 +14,20 @@ use divergence_core::quantization::{PqCodebook, ScalarQuantizer, l2_normalize, l
 use divergence_core::{MetricType, VectorId};
 use divergence_engine::{
     disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
-    disk_graph_search_pipe_v3_refine, disk_graph_search_pq, disk_graph_search_refine,
+    disk_graph_search_pipe_v3_pagesched,
+    disk_graph_search_pipe_v3_refine, disk_graph_search_pipe_v3_refine_3stage,
+    disk_graph_search_pipe_v3_refine_fp16, disk_graph_search_pipe_v3_refine_int8,
+    disk_graph_search_pipe_v3_traced,
+    disk_graph_search_pq, disk_graph_search_refine,
     AdaEfParams, AdaEfStats, AdaEfTable, estimate_ada_ef,
-    AdjacencyPool, IoDriver, VectorReader, PerfLevel, QueryRecorder, SearchGuard, SearchPerfContext,
+    AdjacencyPool, Fp16VectorReader, Int8VectorReader, IoDriver, VectorReader, PerfLevel, QueryRecorder, SearchGuard, SearchPerfContext,
+    TraceRecorder,
 };
 use divergence_index::{NswBuilder, NswConfig};
 use divergence_storage::{
-    load_vectors, IndexMeta, IndexWriter,
-    AdjIndexEntry, bfs_reorder_graph, load_adj_index,
+    load_vectors, write_vectors_fp16_file, write_vectors_int8_file, IndexMeta, IndexWriter,
+    AdjIndexEntry, bfs_reorder_graph, heavy_edge_reorder_graph, load_adj_index,
+    neighbor_run_reorder_graph, twpp_reorder_graph,
 };
 
 use rand::Rng;
@@ -5869,6 +5875,9 @@ struct BenchResult {
     /// Total IO requests per query: adj_phy + refine vector reads.
     /// Note: adj reads are 4KB pages, refine reads are dim*4 bytes each.
     avg_total_io_q: f64,
+    /// Actual refine IO bytes submitted to kernel (from read_at return, not estimated).
+    /// 0 for non-int8 paths (where we don't track bytes yet).
+    avg_refine_bytes: f64,
 }
 
 async fn run_bench(
@@ -6081,6 +6090,7 @@ async fn run_bench(
         avg_refine_count: 0.0,
         avg_refine_ms: 0.0,
         avg_total_io_q: sum_phys_reads as f64 / nf,
+        avg_refine_bytes: 0.0,
     }
 }
 
@@ -6229,6 +6239,7 @@ async fn run_bench_v3(
         avg_refine_count: 0.0,
         avg_refine_ms: 0.0,
         avg_total_io_q: sum_phys_reads as f64 / nf,
+        avg_refine_bytes: 0.0,
     }
 }
 
@@ -6354,7 +6365,7 @@ async fn run_bench_v3_refine(
     let hit_rate = if sum_blk > 0 { sum_hit as f64 / sum_blk as f64 * 100.0 } else { 0.0 };
     let ns_to_ms = 1.0 / 1_000_000.0;
 
-    eprintln!("    [refine R={}: {:.0} refines/q, {:.2} ms/q refine IO]",
+    eprintln!("    [refine R={}: {:.0} refines/q, {:.2} ms/q refine IO (FP32)]",
         refine_r,
         sum_refine_count as f64 / nf,
         sum_refine_ns as f64 / nf * ns_to_ms);
@@ -6392,6 +6403,327 @@ async fn run_bench_v3_refine(
         avg_refine_count: sum_refine_count as f64 / nf,
         avg_refine_ms: sum_refine_ns as f64 / nf * ns_to_ms,
         avg_total_io_q: sum_phys_reads as f64 / nf + sum_refine_count as f64 / nf,
+        avg_refine_bytes: 0.0,  // FP32 path: not tracked
+    }
+}
+
+async fn run_bench_v3_refine_fp16(
+    cfg: &BenchConfig,
+    refine_r: usize,
+    refine_inflight: usize,
+    entry_set: &[VectorId],
+    pool: &Rc<AdjacencyPool>,
+    io: &Rc<IoDriver>,
+    cheap_bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    vec_reader: &Rc<Fp16VectorReader>,
+    query_vecs: &[Vec<f32>],
+    ground_truth: &[Vec<u32>],
+) -> BenchResult {
+    let nq = cfg.num_queries.min(query_vecs.len());
+
+    for q in query_vecs.iter().take(cfg.warmup_queries) {
+        let mut perf = SearchPerfContext::default();
+        disk_graph_search_pipe_v3(
+            q, entry_set, cfg.k, cfg.ef, cfg.prefetch_width,
+            cfg.stall_limit, cfg.drain_budget,
+            pool, io, cheap_bank, adj_index, &mut perf, PerfLevel::CountOnly,
+        ).await;
+    }
+
+    let mut recalls = Vec::with_capacity(nq);
+    let mut latencies_ms = Vec::with_capacity(nq);
+    let mut sum_exp = 0u64;
+    let mut sum_useful = 0u64;
+    let mut sum_wasted = 0u64;
+    let mut sum_blk = 0u64;
+    let mut sum_miss = 0u64;
+    let mut sum_hit = 0u64;
+    let mut sum_phys_reads = 0u64;
+    let mut sum_sf = 0u64;
+    let mut sum_pf_issued = 0u64;
+    let mut sum_pf_consumed = 0u64;
+    let mut sum_best_at = 0u64;
+    let mut sum_first_topk = 0u64;
+    let mut early_count = 0u64;
+    let mut sum_io_wait_ns = 0u64;
+    let mut sum_compute_ns = 0u64;
+    let mut sum_dist_ns = 0u64;
+    let mut sum_refine_ns = 0u64;
+    let mut sum_refine_count = 0u64;
+    let mut sum_refine_bytes = 0u64;
+
+    let cache_stats_before = pool.stats();
+    let wall_start = std::time::Instant::now();
+
+    for i in 0..nq {
+        if cfg.clear_per_query {
+            pool.pause_prefetch(true);
+            pool.drain_prefetch();
+            monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+            while pool.has_loading() {
+                monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+            }
+            pool.clear();
+            pool.pause_prefetch(false);
+        }
+        let q = &query_vecs[i];
+        let mut perf = SearchPerfContext::default();
+        let t0 = std::time::Instant::now();
+
+        let candidates = disk_graph_search_pipe_v3_refine_fp16(
+            q, entry_set, cfg.k, cfg.ef, refine_r, cfg.prefetch_width,
+            cfg.stall_limit, cfg.drain_budget,
+            pool, io, cheap_bank, adj_index, vec_reader,
+            refine_inflight, &mut perf, PerfLevel::EnableTime,
+        ).await;
+
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+        latencies_ms.push(elapsed_ms);
+
+        let ids: Vec<u32> = candidates.iter().map(|s| s.id.0).collect();
+        let q_recall = recall_at_k(&ids, &ground_truth[i]);
+        recalls.push(q_recall);
+
+        sum_exp += perf.expansions;
+        sum_useful += perf.useful_expansions;
+        sum_wasted += perf.wasted_expansions;
+        sum_blk += perf.blocks_read;
+        sum_miss += perf.blocks_miss;
+        sum_hit += perf.blocks_hit;
+        sum_phys_reads += perf.phys_reads;
+        sum_sf += perf.singleflight_waits;
+        sum_pf_issued += perf.prefetch_issued;
+        sum_pf_consumed += perf.prefetch_consumed;
+        sum_best_at += perf.best_result_at_expansion;
+        sum_first_topk += perf.first_topk_at_expansion;
+        sum_io_wait_ns += perf.io_wait_ns;
+        sum_compute_ns += perf.compute_ns;
+        sum_dist_ns += perf.dist_ns;
+        sum_refine_ns += perf.refine_ns;
+        sum_refine_count += perf.refine_count;
+        sum_refine_bytes += perf.refine_bytes;
+        if perf.stopped_early {
+            early_count += 1;
+        }
+    }
+
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let nf = nq as f64;
+
+    let mean_recall = recalls.iter().sum::<f64>() / nf;
+    let qps = nf / wall_secs;
+
+    let mut sorted_lat = latencies_ms.clone();
+    sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&sorted_lat, 50.0);
+    let p99 = percentile(&sorted_lat, 99.0);
+
+    let total_exp = sum_useful + sum_wasted;
+    let waste_ratio = if total_exp > 0 { sum_wasted as f64 / total_exp as f64 * 100.0 } else { 0.0 };
+    let hit_rate = if sum_blk > 0 { sum_hit as f64 / sum_blk as f64 * 100.0 } else { 0.0 };
+    let ns_to_ms = 1.0 / 1_000_000.0;
+
+    eprintln!("    [fp16 refine R={}: {:.0} refines/q, {:.2} ms/q refine IO, {:.0} KB/q actual]",
+        refine_r,
+        sum_refine_count as f64 / nf,
+        sum_refine_ns as f64 / nf * ns_to_ms,
+        sum_refine_bytes as f64 / nf / 1024.0);
+
+    BenchResult {
+        recall: mean_recall,
+        lat_p50_ms: p50,
+        lat_p99_ms: p99,
+        qps,
+        avg_expansions: sum_exp as f64 / nf,
+        avg_useful: sum_useful as f64 / nf,
+        avg_wasted: sum_wasted as f64 / nf,
+        avg_blk_q: sum_blk as f64 / nf,
+        avg_miss_q: sum_miss as f64 / nf,
+        avg_hit_q: sum_hit as f64 / nf,
+        avg_singleflight: sum_sf as f64 / nf,
+        avg_pf_issued: sum_pf_issued as f64 / nf,
+        avg_pf_consumed: sum_pf_consumed as f64 / nf,
+        avg_best_at: sum_best_at as f64 / nf,
+        avg_first_topk: sum_first_topk as f64 / nf,
+        early_stop_pct: early_count as f64 / nf * 100.0,
+        waste_ratio,
+        hit_rate,
+        avg_phys_reads_q: sum_phys_reads as f64 / nf,
+        avg_io_wait_ms: sum_io_wait_ns as f64 / nf * ns_to_ms,
+        avg_compute_ms: sum_compute_ns as f64 / nf * ns_to_ms,
+        avg_dist_ms: sum_dist_ns as f64 / nf * ns_to_ms,
+        ms_per_miss: if sum_miss > 0 {
+            (sum_io_wait_ns as f64 * ns_to_ms) / sum_miss as f64
+        } else {
+            0.0
+        },
+        total_bypasses: pool.stats().bypasses - cache_stats_before.bypasses,
+        total_evict_fail: pool.stats().evict_fail_all_pinned - cache_stats_before.evict_fail_all_pinned,
+        avg_refine_count: sum_refine_count as f64 / nf,
+        avg_refine_ms: sum_refine_ns as f64 / nf * ns_to_ms,
+        avg_total_io_q: sum_phys_reads as f64 / nf + sum_refine_count as f64 / nf,
+        avg_refine_bytes: sum_refine_bytes as f64 / nf,
+    }
+}
+
+async fn run_bench_v3_refine_int8(
+    cfg: &BenchConfig,
+    refine_r: usize,
+    refine_inflight: usize,
+    entry_set: &[VectorId],
+    pool: &Rc<AdjacencyPool>,
+    io: &Rc<IoDriver>,
+    cheap_bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    vec_reader: &Rc<Int8VectorReader>,
+    query_vecs: &[Vec<f32>],
+    ground_truth: &[Vec<u32>],
+) -> BenchResult {
+    let nq = cfg.num_queries.min(query_vecs.len());
+
+    for q in query_vecs.iter().take(cfg.warmup_queries) {
+        let mut perf = SearchPerfContext::default();
+        disk_graph_search_pipe_v3(
+            q, entry_set, cfg.k, cfg.ef, cfg.prefetch_width,
+            cfg.stall_limit, cfg.drain_budget,
+            pool, io, cheap_bank, adj_index, &mut perf, PerfLevel::CountOnly,
+        ).await;
+    }
+
+    let mut recalls = Vec::with_capacity(nq);
+    let mut latencies_ms = Vec::with_capacity(nq);
+    let mut sum_exp = 0u64;
+    let mut sum_useful = 0u64;
+    let mut sum_wasted = 0u64;
+    let mut sum_blk = 0u64;
+    let mut sum_miss = 0u64;
+    let mut sum_hit = 0u64;
+    let mut sum_phys_reads = 0u64;
+    let mut sum_sf = 0u64;
+    let mut sum_pf_issued = 0u64;
+    let mut sum_pf_consumed = 0u64;
+    let mut sum_best_at = 0u64;
+    let mut sum_first_topk = 0u64;
+    let mut early_count = 0u64;
+    let mut sum_io_wait_ns = 0u64;
+    let mut sum_compute_ns = 0u64;
+    let mut sum_dist_ns = 0u64;
+    let mut sum_refine_ns = 0u64;
+    let mut sum_refine_count = 0u64;
+    let mut sum_refine_bytes = 0u64;
+
+    let cache_stats_before = pool.stats();
+    let wall_start = std::time::Instant::now();
+
+    for i in 0..nq {
+        if cfg.clear_per_query {
+            pool.pause_prefetch(true);
+            pool.drain_prefetch();
+            monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+            while pool.has_loading() {
+                monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+            }
+            pool.clear();
+            pool.pause_prefetch(false);
+        }
+        let q = &query_vecs[i];
+        let mut perf = SearchPerfContext::default();
+        let t0 = std::time::Instant::now();
+
+        let candidates = disk_graph_search_pipe_v3_refine_int8(
+            q, entry_set, cfg.k, cfg.ef, refine_r, cfg.prefetch_width,
+            cfg.stall_limit, cfg.drain_budget,
+            pool, io, cheap_bank, adj_index, vec_reader,
+            refine_inflight, &mut perf, PerfLevel::EnableTime,
+        ).await;
+
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+        latencies_ms.push(elapsed_ms);
+
+        let ids: Vec<u32> = candidates.iter().map(|s| s.id.0).collect();
+        let q_recall = recall_at_k(&ids, &ground_truth[i]);
+        recalls.push(q_recall);
+
+        sum_exp += perf.expansions;
+        sum_useful += perf.useful_expansions;
+        sum_wasted += perf.wasted_expansions;
+        sum_blk += perf.blocks_read;
+        sum_miss += perf.blocks_miss;
+        sum_hit += perf.blocks_hit;
+        sum_phys_reads += perf.phys_reads;
+        sum_sf += perf.singleflight_waits;
+        sum_pf_issued += perf.prefetch_issued;
+        sum_pf_consumed += perf.prefetch_consumed;
+        sum_best_at += perf.best_result_at_expansion;
+        sum_first_topk += perf.first_topk_at_expansion;
+        sum_io_wait_ns += perf.io_wait_ns;
+        sum_compute_ns += perf.compute_ns;
+        sum_dist_ns += perf.dist_ns;
+        sum_refine_ns += perf.refine_ns;
+        sum_refine_count += perf.refine_count;
+        sum_refine_bytes += perf.refine_bytes;
+        if perf.stopped_early {
+            early_count += 1;
+        }
+    }
+
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let nf = nq as f64;
+
+    let mean_recall = recalls.iter().sum::<f64>() / nf;
+    let qps = nf / wall_secs;
+
+    let mut sorted_lat = latencies_ms.clone();
+    sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&sorted_lat, 50.0);
+    let p99 = percentile(&sorted_lat, 99.0);
+
+    let total_exp = sum_useful + sum_wasted;
+    let waste_ratio = if total_exp > 0 { sum_wasted as f64 / total_exp as f64 * 100.0 } else { 0.0 };
+    let hit_rate = if sum_blk > 0 { sum_hit as f64 / sum_blk as f64 * 100.0 } else { 0.0 };
+    let ns_to_ms = 1.0 / 1_000_000.0;
+
+    eprintln!("    [int8 refine R={}: {:.0} refines/q, {:.2} ms/q refine IO, {:.0} KB/q actual]",
+        refine_r,
+        sum_refine_count as f64 / nf,
+        sum_refine_ns as f64 / nf * ns_to_ms,
+        sum_refine_bytes as f64 / nf / 1024.0);
+
+    BenchResult {
+        recall: mean_recall,
+        lat_p50_ms: p50,
+        lat_p99_ms: p99,
+        qps,
+        avg_expansions: sum_exp as f64 / nf,
+        avg_useful: sum_useful as f64 / nf,
+        avg_wasted: sum_wasted as f64 / nf,
+        avg_blk_q: sum_blk as f64 / nf,
+        avg_miss_q: sum_miss as f64 / nf,
+        avg_hit_q: sum_hit as f64 / nf,
+        avg_singleflight: sum_sf as f64 / nf,
+        avg_pf_issued: sum_pf_issued as f64 / nf,
+        avg_pf_consumed: sum_pf_consumed as f64 / nf,
+        avg_best_at: sum_best_at as f64 / nf,
+        avg_first_topk: sum_first_topk as f64 / nf,
+        early_stop_pct: early_count as f64 / nf * 100.0,
+        waste_ratio,
+        hit_rate,
+        avg_phys_reads_q: sum_phys_reads as f64 / nf,
+        avg_io_wait_ms: sum_io_wait_ns as f64 / nf * ns_to_ms,
+        avg_compute_ms: sum_compute_ns as f64 / nf * ns_to_ms,
+        avg_dist_ms: sum_dist_ns as f64 / nf * ns_to_ms,
+        ms_per_miss: if sum_miss > 0 {
+            (sum_io_wait_ns as f64 * ns_to_ms) / sum_miss as f64
+        } else {
+            0.0
+        },
+        total_bypasses: pool.stats().bypasses - cache_stats_before.bypasses,
+        total_evict_fail: pool.stats().evict_fail_all_pinned - cache_stats_before.evict_fail_all_pinned,
+        avg_refine_count: sum_refine_count as f64 / nf,
+        avg_refine_ms: sum_refine_ns as f64 / nf * ns_to_ms,
+        avg_total_io_q: sum_phys_reads as f64 / nf + sum_refine_count as f64 / nf,
+        avg_refine_bytes: sum_refine_bytes as f64 / nf,
     }
 }
 
@@ -6497,6 +6829,7 @@ fn exp_bench_stable() {
             &entry_ids,
             index.vectors_raw(), |vid| index.neighbors(vid),
             &reorder,
+            "bfs",
         )
         .unwrap();
     // Copy vectors.dat to v3 dir (IoDriver + VectorBank need same dir)
@@ -7053,6 +7386,7 @@ fn exp_bench_stable() {
                         avg_refine_count: 0.0,
                         avg_refine_ms: 0.0,
                         avg_total_io_q: sum_phys_reads as f64 / nf,
+                        avg_refine_bytes: 0.0,
                     };
                     print_bench_row(&cfg, &result);
                     pool.stop_prefetch();
@@ -8419,6 +8753,7 @@ fn exp_saq_graph() {
         n as u32, dim, "cosine", index.max_degree(), ef_construction,
         &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
         &reorder,
+        "bfs",
     ).unwrap();
     std::fs::copy(dir_path.join("vectors.dat"), v3_dir.join("vectors.dat")).unwrap();
     let v3_meta = IndexMeta::load_from(&v3_dir.join("meta.json")).unwrap();
@@ -8558,6 +8893,1673 @@ fn exp_saq_graph() {
                 print_bench_row(&cfg, &result);
                 pool.stop_prefetch();
                 handle.await;
+            }
+
+            // --- Stage 3: Hub pinning + SAQ+refine (R=160) ---
+            eprintln!("\n=== Hub Pinning: SAQ+ref-R160 with pin64/pin128 (perq-cold) ===");
+            for &pin_count in &[64u32, 128u32] {
+                let pin_pages: Vec<u32> = (0..pin_count).collect();
+                let label = format!("SAQ+R160-pin{}", pin_count);
+                let cfg = BenchConfig {
+                    label: label.clone(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                };
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let actually_pinned = pool.pin_pages(&pin_pages, &io).await
+                    .expect("pin_pages failed");
+                eprintln!("  pin{}: requested={}, actually_pinned={}",
+                    pin_count, pin_count, actually_pinned);
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+                let result = run_bench_v3_refine(
+                    &cfg, 160, refine_inflight,
+                    &entry_set, &pool, &io, saq_bench_bank,
+                    &adj_index, &vec_reader, &query_vecs, &ground_truth,
+                ).await;
+                print_bench_row(&cfg, &result);
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // --- Stage 4: Int8 refine (4× fewer bytes per refine read) ---
+            eprintln!("\n=== Int8 Refine: SAQ graph → int8 disk refine (perq-cold) ===");
+            eprintln!("  Int8 encoding: round(f32 * 127), {} B/vec (vs {} B/vec FP32) = {:.1}× smaller",
+                dim, dim * 4, 4.0);
+
+            // Write int8 vectors to disk
+            let int8_path = v3_dir.join("vectors_int8.dat");
+            write_vectors_int8_file(&int8_path, &disk_vectors, dim).unwrap();
+            let int8_size = std::fs::metadata(&int8_path).unwrap().len();
+            eprintln!("  Wrote vectors_int8.dat: {} vectors × {} B = {:.1} MB",
+                n, dim, int8_size as f64 / 1024.0 / 1024.0);
+
+            let int8_reader = Rc::new(
+                Int8VectorReader::open(v3_dir.to_str().unwrap(), dim, direct_io)
+                    .await
+                    .expect("failed to open Int8VectorReader"),
+            );
+
+            // Sweep R with int8 refine
+            for &refine_r in &[120usize, 160, 200] {
+                let label = format!("i8+ref-R{}", refine_r);
+                let cfg = BenchConfig {
+                    label: label.clone(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                };
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+                let result = run_bench_v3_refine_int8(
+                    &cfg, refine_r, refine_inflight,
+                    &entry_set, &pool, &io, saq_bench_bank,
+                    &adj_index, &int8_reader, &query_vecs, &ground_truth,
+                ).await;
+                print_bench_row(&cfg, &result);
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // Int8 refine + hub pinning (best combo)
+            eprintln!("\n=== Int8 Refine + Hub Pinning (pin128, perq-cold) ===");
+            {
+                let pin_pages: Vec<u32> = (0..128u32).collect();
+                let label = "i8+R160-pin128".to_string();
+                let cfg = BenchConfig {
+                    label: label.clone(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                };
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let actually_pinned = pool.pin_pages(&pin_pages, &io).await
+                    .expect("pin_pages failed");
+                eprintln!("  pin128: requested=128, actually_pinned={}", actually_pinned);
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+                let result = run_bench_v3_refine_int8(
+                    &cfg, 160, refine_inflight,
+                    &entry_set, &pool, &io, saq_bench_bank,
+                    &adj_index, &int8_reader, &query_vecs, &ground_truth,
+                ).await;
+                print_bench_row(&cfg, &result);
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // --- Stage 5: FP16 refine (2× smaller IO, near-lossless recall) ---
+            eprintln!("\n=== FP16 Refine: SAQ graph → FP16 disk refine (perq-cold) ===");
+            eprintln!("  FP16 encoding: IEEE 754 half-precision, {} B/vec (vs {} B/vec FP32) = 2× smaller",
+                dim * 2, dim * 4);
+
+            let fp16_path = v3_dir.join("vectors_fp16.dat");
+            write_vectors_fp16_file(&fp16_path, &disk_vectors, dim).unwrap();
+            let fp16_size = std::fs::metadata(&fp16_path).unwrap().len();
+            eprintln!("  Wrote vectors_fp16.dat: {} vectors × {} B = {:.1} MB",
+                n, dim * 2, fp16_size as f64 / 1024.0 / 1024.0);
+
+            let fp16_reader = Rc::new(
+                Fp16VectorReader::open(v3_dir.to_str().unwrap(), dim, direct_io)
+                    .await
+                    .expect("failed to open Fp16VectorReader"),
+            );
+
+            // Sweep R with FP16 refine
+            for &refine_r in &[120usize, 160, 200] {
+                let label = format!("f16+ref-R{}", refine_r);
+                let cfg = BenchConfig {
+                    label: label.clone(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                };
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+                let result = run_bench_v3_refine_fp16(
+                    &cfg, refine_r, refine_inflight,
+                    &entry_set, &pool, &io, saq_bench_bank,
+                    &adj_index, &fp16_reader, &query_vecs, &ground_truth,
+                ).await;
+                print_bench_row(&cfg, &result);
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // FP16 refine + hub pinning (best combo)
+            eprintln!("\n=== FP16 Refine + Hub Pinning (pin128, perq-cold) ===");
+            {
+                let pin_pages: Vec<u32> = (0..128u32).collect();
+                let label = "f16+R160-pin128".to_string();
+                let cfg = BenchConfig {
+                    label: label.clone(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                };
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let actually_pinned = pool.pin_pages(&pin_pages, &io).await
+                    .expect("pin_pages failed");
+                eprintln!("  pin128: requested=128, actually_pinned={}", actually_pinned);
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+                let result = run_bench_v3_refine_fp16(
+                    &cfg, 160, refine_inflight,
+                    &entry_set, &pool, &io, saq_bench_bank,
+                    &adj_index, &fp16_reader, &query_vecs, &ground_truth,
+                ).await;
+                print_bench_row(&cfg, &result);
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // --- Stage 6: Three-stage pipeline (SAQ → int8 filter → FP32 exact) ---
+            eprintln!("\n=== Three-Stage: SAQ → int8 filter → FP32 refine (perq-cold) ===");
+            eprintln!("  R=160 SAQ candidates → int8 filter to top-T → FP32 exact on T");
+            eprintln!("  Expected IO: R×1KB int8 + T×3KB FP32. T < R saves FP32 reads.");
+
+            for &int8_topk in &[120usize, 80, 60, 40] {
+                let label = format!("3stg-R160-T{}", int8_topk);
+                let cfg = BenchConfig {
+                    label: label.clone(),
+                    ef: 200, k, prefetch_width: 4,
+                    stall_limit: 0, drain_budget: 0,
+                    adj_inflight: 64, cache_pct,
+                    num_queries, warmup_queries: 0,
+                    ada_ef: false,
+                    clear_per_query: true,
+                };
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                );
+
+                // Run 3-stage search for each query, collect results
+                let nq = num_queries.min(query_vecs.len());
+                let mut recalls = Vec::with_capacity(nq);
+                let mut latencies_ms = Vec::with_capacity(nq);
+                let mut sum_refine_bytes = 0u64;
+                let mut sum_refine_ns = 0u64;
+                let mut sum_refine_count = 0u64;
+                let wall_start = std::time::Instant::now();
+
+                for i in 0..nq {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let q = &query_vecs[i];
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+
+                    let results = disk_graph_search_pipe_v3_refine_3stage(
+                        q, &entry_set, k, 200, 160, int8_topk, 4,
+                        0, 0,
+                        &pool, &io, saq_bench_bank, &adj_index,
+                        &int8_reader, &vec_reader,
+                        refine_inflight, &mut perf, PerfLevel::EnableTime,
+                    ).await;
+
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &ground_truth[i]));
+                    sum_refine_bytes += perf.refine_bytes;
+                    sum_refine_ns += perf.refine_ns;
+                    sum_refine_count += perf.refine_count;
+                }
+
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = nq as f64;
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+                let ns_to_ms = 1.0 / 1_000_000.0;
+
+                eprintln!(
+                    "  {:<18} recall={:.3}  p50={:.1}ms  p99={:.1}ms  QPS={:.1}  ref_ms={:.2}  refine_bytes/q={:.0}KB  refines/q={:.0}",
+                    label, mean_recall, p50, p99, qps,
+                    sum_refine_ns as f64 / nf * ns_to_ms,
+                    sum_refine_bytes as f64 / nf / 1024.0,
+                    sum_refine_count as f64 / nf,
+                );
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+        });
+    }) {
+        eprintln!("Skipped: io_uring not available");
+    }
+}
+
+// ===== TWPP: Trace-Weighted Page Packing Experiment =====
+
+/// Helper: compute unique pages touched for a set of VID expansions using adj_index.
+fn unique_pages_for_query(expanded_vids: &[u32], adj_index: &[AdjIndexEntry]) -> usize {
+    let mut pages = std::collections::HashSet::new();
+    for &vid in expanded_vids {
+        pages.insert(adj_index[vid as usize].page_id);
+    }
+    pages.len()
+}
+
+/// Helper: run a benchmark pass (cold or warm) with full counter reporting.
+/// Returns (label printed). All output via eprintln.
+struct TwppBenchCounters {
+    recalls: Vec<f64>,
+    latencies_ms: Vec<f64>,
+    sum_exp: u64,
+    sum_blk: u64,
+    sum_miss: u64,
+    sum_hit: u64,
+    sum_phys: u64,
+    sum_pf_issued: u64,
+    sum_pf_consumed: u64,
+    sum_sf: u64,
+    sum_unique_pages: u64,
+    wall_secs: f64,
+}
+
+/// Benchmark BFS vs TWPP page layouts for adjacency pages.
+///
+/// Methodology:
+/// 1. Build NSW index on Cohere dataset
+/// 2. Write BFS layout (baseline)
+/// 3. Collect co-expansion traces from queries [0..200) on BFS layout (cold)
+/// 4. Compute TWPP reorder from traces
+/// 5. Write TWPP layout with same graph, different page assignment
+/// 6. A/B benchmark on DISJOINT holdout queries [200..300+warmup)
+///
+/// Validation:
+/// - Hard train/test split: trace queries [0..200) ≠ bench queries [200..300+)
+/// - Trace is observational only (untraced search gives identical results)
+/// - Pool config printed for both layouts (bytes, sets, slots)
+/// - Full cache counter breakdown (prefetch, bypass, singleflight)
+/// - unique_pages/q from adj_index cross-checked against phys/q under cold
+#[test]
+#[ignore] // EC2-only: BENCH_DIR + COHERE_DIR required
+fn exp_twpp() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let ef = 200;
+    let prefetch_width = 4;
+    let num_trace_queries = 200;       // train: queries [0..200)
+    let num_bench_queries = 100;       // test: queries [200..300)
+    let warmup_queries = 20;           // warm: queries [300..320) — disjoint from measured
+    let cache_pct = 5usize;
+
+    // Hard train/test split boundaries
+    let bench_start = num_trace_queries;                           // 200
+    let bench_end = bench_start + num_bench_queries;               // 300
+    let warmup_start = bench_end;                                  // 300
+    let warmup_end = warmup_start + warmup_queries;                // 320
+    let total_queries_needed = warmup_end;                         // 320
+
+    assert!(nq >= total_queries_needed,
+        "Need {} queries (200 trace + 100 bench + 20 warmup) but dataset has {}",
+        total_queries_needed, nq);
+
+    eprintln!("=== EXP-TWPP: Cohere {}K, dim={}, k={} ===", n / 1000, dim, k);
+    eprintln!("  Train/test split: trace=[0..{}), bench=[{}..{}), warmup=[{}..{})",
+        num_trace_queries, bench_start, bench_end, warmup_start, warmup_end);
+
+    // 1. Build NSW index
+    eprintln!("Building NSW index (n={}, m_max={}, ef_c={}) ...", n, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
+    let entry_set: Vec<VectorId> = index.entry_set().to_vec();
+
+    // 2. Write BFS v3 layout
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let base_dir: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        base_dir = std::path::PathBuf::from(bd).join("twpp");
+        std::fs::create_dir_all(&base_dir).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        base_dir = _tmpdir.path().to_path_buf();
+    }
+
+    // Write vectors.dat (shared by both layouts)
+    let vec_dir = base_dir.clone();
+    let writer_base = IndexWriter::new(&vec_dir);
+    writer_base.write(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+    ).unwrap();
+    let disk_vectors = load_vectors(&vec_dir.join("vectors.dat"), n, dim).unwrap();
+
+    // BFS layout
+    let bfs_dir = base_dir.join("bfs");
+    std::fs::create_dir_all(&bfs_dir).unwrap();
+    let bfs_reorder = bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
+    let bfs_writer = IndexWriter::new(&bfs_dir);
+    bfs_writer.write_v3(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+        &bfs_reorder,
+        "bfs",
+    ).unwrap();
+    std::fs::copy(vec_dir.join("vectors.dat"), bfs_dir.join("vectors.dat")).unwrap();
+    let bfs_meta = IndexMeta::load_from(&bfs_dir.join("meta.json")).unwrap();
+    let bfs_num_pages = bfs_meta.num_pages.unwrap_or(0) as usize;
+    eprintln!("  BFS layout: {} pages, written to {:?}", bfs_num_pages, bfs_dir);
+
+    let bfs_adj_index = load_adj_index(
+        &bfs_dir.join("adj_index.dat"),
+        bfs_meta.num_vectors as usize,
+    ).unwrap();
+
+    // All query vectors we need (0..warmup_end)
+    let all_query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(total_queries_needed).map(|c| c.to_vec()).collect();
+
+    // Slices
+    let trace_queries = &all_query_vecs[0..num_trace_queries];
+    let bench_queries = &all_query_vecs[bench_start..bench_end];
+    let bench_gt = &ground_truth[bench_start..bench_end];
+    let warmup_query_slice = &all_query_vecs[warmup_start..warmup_end];
+
+    let bfs_dir_str = bfs_dir.to_str().unwrap().to_owned();
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // 3. Collect traces on BFS layout (cold, queries [0..200))
+            eprintln!("\n--- Phase 1: Trace collection ({} queries [0..{}), cold, BFS layout) ---",
+                num_trace_queries, num_trace_queries);
+            let mut trace_recorder = TraceRecorder::with_capacity(n, n * 4);
+
+            {
+                let io = Rc::new(
+                    IoDriver::open_pages(&bfs_dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                // Pool sizing: same for trace collection
+                let trace_pool_pages = (bfs_num_pages * cache_pct / 100).max(256);
+                let trace_pool_bytes = trace_pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(trace_pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                // Validation: run first query both traced and untraced, compare results
+                {
+                    let q = &trace_queries[0];
+                    let mut perf_traced = SearchPerfContext::default();
+                    let mut perf_untraced = SearchPerfContext::default();
+                    let mut dummy_trace = TraceRecorder::new();
+
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let results_traced = disk_graph_search_pipe_v3_traced(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &bfs_adj_index,
+                        &mut perf_traced, PerfLevel::CountOnly, &mut dummy_trace,
+                    ).await;
+
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let results_untraced = disk_graph_search_pipe_v3(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &bfs_adj_index,
+                        &mut perf_untraced, PerfLevel::CountOnly,
+                    ).await;
+
+                    assert_eq!(
+                        results_traced.len(), results_untraced.len(),
+                        "Trace validation FAIL: result count differs ({} vs {})",
+                        results_traced.len(), results_untraced.len()
+                    );
+                    for (t, u) in results_traced.iter().zip(results_untraced.iter()) {
+                        assert_eq!(t.id, u.id,
+                            "Trace validation FAIL: result VIDs differ");
+                    }
+                    assert_eq!(
+                        perf_traced.expansions, perf_untraced.expansions,
+                        "Trace validation FAIL: expansion count differs ({} vs {})",
+                        perf_traced.expansions, perf_untraced.expansions
+                    );
+                    eprintln!("  Trace validation PASS: traced == untraced (expansions={}, results={})",
+                        perf_traced.expansions, results_traced.len());
+                }
+
+                // Collect traces (cold per query)
+                for qi in 0..num_trace_queries {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pipe_v3_traced(
+                        &trace_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &bfs_adj_index,
+                        &mut perf, PerfLevel::CountOnly, &mut trace_recorder,
+                    ).await;
+                }
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            eprintln!("  Trace: {} unique co-expand pairs, {} unique VIDs expanded",
+                trace_recorder.co_expand.len(), trace_recorder.node_counts.len());
+            {
+                let total_expansions: u64 = trace_recorder.node_counts.values()
+                    .map(|&c| c as u64).sum();
+                let max_count = trace_recorder.node_counts.values().copied().max().unwrap_or(0);
+                let total_co_expand_weight: u64 = trace_recorder.co_expand.values()
+                    .map(|&c| c as u64).sum();
+                eprintln!("  Total expansions: {}, max node count: {}, total co-expand weight: {}",
+                    total_expansions, max_count, total_co_expand_weight);
+            }
+
+            // 4. Compute TWPP reorder
+            eprintln!("\n--- Phase 2: TWPP reorder computation ---");
+            let t0_twpp = std::time::Instant::now();
+            let twpp_reorder = twpp_reorder_graph(
+                n,
+                |vid| index.neighbors(vid),
+                &trace_recorder.co_expand,
+                &trace_recorder.node_counts,
+            );
+            eprintln!("  TWPP reorder computed in {:.1}s", t0_twpp.elapsed().as_secs_f64());
+
+            // 5. Write TWPP layout
+            let twpp_dir = base_dir.join("twpp");
+            std::fs::create_dir_all(&twpp_dir).unwrap();
+            let twpp_writer = IndexWriter::new(&twpp_dir);
+            twpp_writer.write_v3(
+                n as u32, dim, "cosine", index.max_degree(), ef_construction,
+                &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+                &twpp_reorder,
+                "twpp",
+            ).unwrap();
+            std::fs::copy(vec_dir.join("vectors.dat"), twpp_dir.join("vectors.dat")).unwrap();
+            let twpp_meta = IndexMeta::load_from(&twpp_dir.join("meta.json")).unwrap();
+            let twpp_num_pages = twpp_meta.num_pages.unwrap_or(0) as usize;
+            eprintln!("  TWPP layout: {} pages (BFS: {} pages, delta: {:+})",
+                twpp_num_pages, bfs_num_pages, twpp_num_pages as i64 - bfs_num_pages as i64);
+
+            let twpp_adj_index = load_adj_index(
+                &twpp_dir.join("adj_index.dat"),
+                twpp_meta.num_vectors as usize,
+            ).unwrap();
+            let twpp_dir_str = twpp_dir.to_str().unwrap().to_owned();
+
+            // 6. A/B benchmark — cold (cache cleared per query)
+            // Bench queries: [200..300), disjoint from trace queries [0..200)
+            eprintln!("\n--- Phase 3: Cold benchmark ({} holdout queries [{}..{})) ---",
+                num_bench_queries, bench_start, bench_end);
+            eprintln!("{:>12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "layout", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "miss/q", "hit/q", "phys/q",
+                "pf_i/q", "pf_c/q", "sf/q", "upg/q");
+
+            for (label, adj_index_ref, dir_str, num_pages) in [
+                ("BFS", &bfs_adj_index[..], bfs_dir_str.as_str(), bfs_num_pages),
+                ("TWPP", &twpp_adj_index[..], twpp_dir_str.as_str(), twpp_num_pages),
+            ] {
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let layout_pool_pages = (num_pages * cache_pct / 100).max(256);
+                let layout_pool_bytes = layout_pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(layout_pool_bytes));
+                eprintln!("  {} pool: {} bytes, {} sets (=total_slots/8), {} total slots",
+                    label, layout_pool_bytes, pool.total_slots() / 8, pool.total_slots());
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                let mut c = TwppBenchCounters {
+                    recalls: Vec::with_capacity(num_bench_queries),
+                    latencies_ms: Vec::with_capacity(num_bench_queries),
+                    sum_exp: 0, sum_blk: 0, sum_miss: 0, sum_hit: 0, sum_phys: 0,
+                    sum_pf_issued: 0, sum_pf_consumed: 0, sum_sf: 0,
+                    sum_unique_pages: 0, wall_secs: 0.0,
+                };
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    // Clear cache for cold measurement
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pipe_v3(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, adj_index_ref, &mut perf, PerfLevel::EnableTime,
+                    ).await;
+                    c.latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    c.recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                    c.sum_exp += perf.expansions;
+                    c.sum_blk += perf.blocks_read;
+                    c.sum_miss += perf.blocks_miss;
+                    c.sum_hit += perf.blocks_hit;
+                    c.sum_phys += perf.phys_reads;
+                    c.sum_pf_issued += perf.prefetch_issued;
+                    c.sum_pf_consumed += perf.prefetch_consumed;
+                    c.sum_sf += perf.singleflight_waits;
+
+                    // Unique pages from adj_index (ground truth for cold)
+                    // Collect expanded VIDs: we know expansions == blocks_read for v3
+                    // Use adj_index to map each accessed VID to its page
+                    // We can't get exact VIDs here, but we CAN simulate:
+                    // Under cold (empty cache), unique_pages = phys_reads - prefetch_waste
+                    // Instead, run a traced query to get exact VIDs — but that's expensive.
+                    // Simpler: we already have adj_index; do a traced pass below.
+                }
+                c.wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_bench_queries as f64;
+
+                let mean_recall = c.recalls.iter().sum::<f64>() / nf;
+                let qps = nf / c.wall_secs;
+                let mut sorted_lat = c.latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                // Cache stats delta for the entire benchmark
+                let cache_snap = pool.stats();
+                eprintln!("{:>12} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                    label, mean_recall, p50, p99, qps,
+                    c.sum_exp as f64 / nf,
+                    c.sum_blk as f64 / nf,
+                    c.sum_miss as f64 / nf,
+                    c.sum_hit as f64 / nf,
+                    c.sum_phys as f64 / nf,
+                    c.sum_pf_issued as f64 / nf,
+                    c.sum_pf_consumed as f64 / nf,
+                    c.sum_sf as f64 / nf,
+                    0.0); // placeholder for upg/q, filled by traced pass below
+
+                eprintln!("    cache totals: hits={} misses={} bypasses={} evictions={} evict_fail={} pf_hits={} phys={}",
+                    cache_snap.hits, cache_snap.misses, cache_snap.bypasses,
+                    cache_snap.evictions, cache_snap.evict_fail_all_pinned,
+                    cache_snap.prefetch_hits, cache_snap.phys_reads);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // 6b. Unique pages cross-check: run traced cold queries to get exact expansion VIDs
+            eprintln!("\n--- Phase 3b: Unique pages cross-check (traced cold, same holdout queries) ---");
+            for (label, adj_index_ref, dir_str, num_pages) in [
+                ("BFS", &bfs_adj_index[..], bfs_dir_str.as_str(), bfs_num_pages),
+                ("TWPP", &twpp_adj_index[..], twpp_dir_str.as_str(), twpp_num_pages),
+            ] {
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let layout_pool_pages = (num_pages * cache_pct / 100).max(256);
+                let layout_pool_bytes = layout_pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(layout_pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                let mut sum_unique_pages = 0u64;
+                let mut sum_phys = 0u64;
+                let sample_n = num_bench_queries.min(50); // sample for speed
+
+                for qi in 0..sample_n {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    let mut query_trace = TraceRecorder::new();
+                    disk_graph_search_pipe_v3_traced(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, adj_index_ref,
+                        &mut perf, PerfLevel::CountOnly, &mut query_trace,
+                    ).await;
+
+                    // Expanded VIDs for this query
+                    let expanded: Vec<u32> = query_trace.node_counts.keys().copied().collect();
+                    let upq = unique_pages_for_query(&expanded, adj_index_ref);
+                    sum_unique_pages += upq as u64;
+                    sum_phys += perf.phys_reads;
+                }
+
+                let nf = sample_n as f64;
+                eprintln!("  {}: unique_pages/q={:.1}, phys/q={:.1} (delta={:.1}, {} samples)",
+                    label,
+                    sum_unique_pages as f64 / nf,
+                    sum_phys as f64 / nf,
+                    sum_phys as f64 / nf - sum_unique_pages as f64 / nf,
+                    sample_n);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // 7. Warm benchmark — disjoint warmup queries [300..320), measure [200..300)
+            eprintln!("\n--- Phase 4: Warm benchmark ({} queries [{}..{}), warmup [{}..{})) ---",
+                num_bench_queries, bench_start, bench_end, warmup_start, warmup_end);
+            eprintln!("{:>12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "layout", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "miss/q", "hit/q", "phys/q",
+                "pf_i/q", "pf_c/q", "sf/q");
+
+            for (label, adj_index_ref, dir_str, num_pages) in [
+                ("BFS-warm", &bfs_adj_index[..], bfs_dir_str.as_str(), bfs_num_pages),
+                ("TWPP-warm", &twpp_adj_index[..], twpp_dir_str.as_str(), twpp_num_pages),
+            ] {
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let layout_pool_pages = (num_pages * cache_pct / 100).max(256);
+                let layout_pool_bytes = layout_pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(layout_pool_bytes));
+                eprintln!("  {} pool: {} bytes, {} sets (=total_slots/8), {} total slots",
+                    label, layout_pool_bytes, pool.total_slots() / 8, pool.total_slots());
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                // Warmup on DISJOINT queries [300..320)
+                for q in warmup_query_slice {
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pipe_v3(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, adj_index_ref, &mut perf, PerfLevel::CountOnly,
+                    ).await;
+                }
+
+                // Measure on [200..300) — no overlap with warmup
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_phys = 0u64;
+                let mut sum_pf_issued = 0u64;
+                let mut sum_pf_consumed = 0u64;
+                let mut sum_sf = 0u64;
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pipe_v3(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, adj_index_ref, &mut perf, PerfLevel::EnableTime,
+                    ).await;
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_phys += perf.phys_reads;
+                    sum_pf_issued += perf.prefetch_issued;
+                    sum_pf_consumed += perf.prefetch_consumed;
+                    sum_sf += perf.singleflight_waits;
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_bench_queries as f64;
+
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                let cache_snap = pool.stats();
+                eprintln!("{:>12} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                    label, mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_hit as f64 / nf,
+                    sum_phys as f64 / nf,
+                    sum_pf_issued as f64 / nf,
+                    sum_pf_consumed as f64 / nf,
+                    sum_sf as f64 / nf);
+
+                eprintln!("    cache totals: hits={} misses={} bypasses={} evictions={} evict_fail={} pf_hits={} phys={}",
+                    cache_snap.hits, cache_snap.misses, cache_snap.bypasses,
+                    cache_snap.evictions, cache_snap.evict_fail_all_pinned,
+                    cache_snap.prefetch_hits, cache_snap.phys_reads);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+        });
+    }) {
+        eprintln!("Skipped: io_uring not available");
+    }
+}
+
+/// Topology-based page packing experiments.
+///
+/// Three experiments in one test:
+/// 1. Layout comparison (cold): sequential / BFS / neighbor-run / heavy-edge
+///    - Measure: recall, latency, unique_pages/q, phys/q, miss/q, hit/q
+/// 2. Warm benchmark: same 4 layouts with pre-warmed cache
+/// 3. Page-aware scheduling: B-sweep on BFS layout (B=1,4,8,16)
+///    - disk_graph_search_pipe_v3_pagesched with pop_preferred
+///
+/// Holdout protocol: bench [200..300), warmup [300..320), disjoint.
+#[test]
+#[ignore] // EC2-only: BENCH_DIR + COHERE_DIR required
+fn exp_topology_packing() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let ef = 200;
+    let prefetch_width = 4;
+    let num_bench_queries = 100;
+    let warmup_queries = 20;
+    let cache_pct = 5usize;
+    let bench_start = 200;
+    let bench_end = bench_start + num_bench_queries;
+    let warmup_start = bench_end;
+    let warmup_end = warmup_start + warmup_queries;
+
+    assert!(nq >= warmup_end,
+        "Need {} queries but dataset has {}", warmup_end, nq);
+
+    eprintln!("=== EXP-TOPOLOGY: Cohere {}K, dim={}, k={} ===", n / 1000, dim, k);
+    eprintln!("  bench=[{}..{}), warmup=[{}..{})", bench_start, bench_end, warmup_start, warmup_end);
+
+    // Build NSW index
+    eprintln!("Building NSW index (n={}, m_max={}, ef_c={}) ...", n, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
+    let entry_set: Vec<VectorId> = index.entry_set().to_vec();
+
+    // Base dir for all layouts
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let base_dir: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        base_dir = std::path::PathBuf::from(bd).join("topology");
+        std::fs::create_dir_all(&base_dir).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        base_dir = _tmpdir.path().to_path_buf();
+    }
+
+    // Write vectors.dat (shared)
+    let vec_dir = base_dir.clone();
+    let writer_base = IndexWriter::new(&vec_dir);
+    writer_base.write(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+    ).unwrap();
+    let disk_vectors = load_vectors(&vec_dir.join("vectors.dat"), n, dim).unwrap();
+
+    // Compute 4 reorders
+    eprintln!("Computing reorders...");
+    let t0 = std::time::Instant::now();
+
+    // Sequential (identity)
+    let seq_reorder: Vec<u32> = (0..n as u32).collect();
+
+    // BFS
+    let bfs_reorder_map = bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
+
+    // Neighbor-run BFS
+    let nbr_run_reorder_map = neighbor_run_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
+
+    // Heavy-edge (MARGO-style)
+    let heavy_edge_reorder_map = heavy_edge_reorder_graph(n, |vid| index.neighbors(vid));
+
+    eprintln!("  Reorders computed in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // Write all 4 layouts
+    struct LayoutInfo {
+        label: &'static str,
+        dir: std::path::PathBuf,
+        num_pages: usize,
+        adj_index: Vec<AdjIndexEntry>,
+    }
+
+    let reorders: Vec<(&str, Vec<u32>)> = vec![
+        ("sequential", seq_reorder),
+        ("bfs", bfs_reorder_map),
+        ("nbr_run", nbr_run_reorder_map),
+        ("heavy_edge", heavy_edge_reorder_map),
+    ];
+
+    let mut layouts: Vec<LayoutInfo> = Vec::new();
+    for (label, reorder) in &reorders {
+        let layout_dir = base_dir.join(label);
+        std::fs::create_dir_all(&layout_dir).unwrap();
+        let writer = IndexWriter::new(&layout_dir);
+        writer.write_v3(
+            n as u32, dim, "cosine", index.max_degree(), ef_construction,
+            &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+            reorder,
+            label,
+        ).unwrap();
+        std::fs::copy(vec_dir.join("vectors.dat"), layout_dir.join("vectors.dat")).unwrap();
+        let meta = IndexMeta::load_from(&layout_dir.join("meta.json")).unwrap();
+        let num_pages = meta.num_pages.unwrap_or(0) as usize;
+        let adj_index = load_adj_index(
+            &layout_dir.join("adj_index.dat"),
+            meta.num_vectors as usize,
+        ).unwrap();
+        eprintln!("  {}: {} pages, written to {:?}", label, num_pages, layout_dir);
+        layouts.push(LayoutInfo {
+            label,
+            dir: layout_dir,
+            num_pages,
+            adj_index,
+        });
+    }
+
+    // Prepare queries
+    let all_query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(warmup_end).map(|c| c.to_vec()).collect();
+    let bench_queries = &all_query_vecs[bench_start..bench_end];
+    let bench_gt = &ground_truth[bench_start..bench_end];
+    let warmup_query_slice = &all_query_vecs[warmup_start..warmup_end];
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // ===== Phase 1: Cold layout comparison =====
+            eprintln!("\n--- Phase 1: Cold benchmark ({} queries [{}..{})) ---",
+                num_bench_queries, bench_start, bench_end);
+            eprintln!("{:>12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "layout", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "miss/q", "hit/q", "phys/q", "upg/q");
+
+            for layout in &layouts {
+                let dir_str = layout.dir.to_str().unwrap();
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let pool_pages = (layout.num_pages * cache_pct / 100).max(256);
+                let pool_bytes = pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_phys = 0u64;
+                let mut sum_upg = 0u64;
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    // Cold: clear cache
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    let mut query_trace = TraceRecorder::new();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pipe_v3_traced(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &layout.adj_index,
+                        &mut perf, PerfLevel::EnableTime, &mut query_trace,
+                    ).await;
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_phys += perf.phys_reads;
+
+                    let expanded: Vec<u32> = query_trace.node_counts.keys().copied().collect();
+                    sum_upg += unique_pages_for_query(&expanded, &layout.adj_index) as u64;
+                    query_trace = TraceRecorder::new();
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_bench_queries as f64;
+
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                eprintln!("{:>12} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                    layout.label, mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_hit as f64 / nf,
+                    sum_phys as f64 / nf,
+                    sum_upg as f64 / nf);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // ===== Phase 2: Warm layout comparison =====
+            eprintln!("\n--- Phase 2: Warm benchmark (warmup [{}..{}), measure [{}..{})) ---",
+                warmup_start, warmup_end, bench_start, bench_end);
+            eprintln!("{:>12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "layout", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "miss/q", "hit/q", "phys/q");
+
+            for layout in &layouts {
+                let dir_str = layout.dir.to_str().unwrap();
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let pool_pages = (layout.num_pages * cache_pct / 100).max(256);
+                let pool_bytes = pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                // Warmup on disjoint queries
+                for q in warmup_query_slice {
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pipe_v3(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &layout.adj_index, &mut perf, PerfLevel::CountOnly,
+                    ).await;
+                }
+
+                // Measure
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_phys = 0u64;
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pipe_v3(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &layout.adj_index, &mut perf, PerfLevel::EnableTime,
+                    ).await;
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_phys += perf.phys_reads;
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_bench_queries as f64;
+
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                eprintln!("{:>12} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                    layout.label, mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_hit as f64 / nf,
+                    sum_phys as f64 / nf);
+
+                let cache_snap = pool.stats();
+                eprintln!("    cache: hits={} misses={} bypasses={} evictions={} pf_hits={} phys={}",
+                    cache_snap.hits, cache_snap.misses, cache_snap.bypasses,
+                    cache_snap.evictions, cache_snap.prefetch_hits, cache_snap.phys_reads);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // ===== Phase 3: Page-aware scheduling B-sweep on BFS layout =====
+            eprintln!("\n--- Phase 3: Page-aware scheduling B-sweep (BFS layout, warm) ---");
+            eprintln!("{:>8} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "B", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "miss/q", "hit/q", "phys/q", "sched/q");
+
+            let bfs_layout = &layouts[1]; // BFS is index 1
+            for b in [1usize, 4, 8, 16] {
+                let dir_str = bfs_layout.dir.to_str().unwrap();
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let pool_pages = (bfs_layout.num_pages * cache_pct / 100).max(256);
+                let pool_bytes = pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                // Warmup
+                for q in warmup_query_slice {
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pipe_v3_pagesched(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &bfs_layout.adj_index,
+                        &mut perf, PerfLevel::CountOnly, b,
+                    ).await;
+                }
+
+                // Measure
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_phys = 0u64;
+                let mut sum_sched = 0u64;
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pipe_v3_pagesched(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &bfs_layout.adj_index,
+                        &mut perf, PerfLevel::EnableTime, b,
+                    ).await;
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_phys += perf.phys_reads;
+                    sum_sched += perf.page_sched_hits;
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_bench_queries as f64;
+
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                eprintln!("{:>8} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                    format!("B={}", b), mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_hit as f64 / nf,
+                    sum_phys as f64 / nf,
+                    sum_sched as f64 / nf);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            // ===== Phase 4: Combined best-layout + B=8 scheduling =====
+            eprintln!("\n--- Phase 4: Combined (each layout + B=8 scheduling, warm) ---");
+            eprintln!("{:>16} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "layout+B", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "miss/q", "hit/q", "phys/q", "sched/q");
+
+            for layout in &layouts {
+                let dir_str = layout.dir.to_str().unwrap();
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let pool_pages = (layout.num_pages * cache_pct / 100).max(256);
+                let pool_bytes = pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                // Warmup
+                for q in warmup_query_slice {
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pipe_v3_pagesched(
+                        q, &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &layout.adj_index,
+                        &mut perf, PerfLevel::CountOnly, 8,
+                    ).await;
+                }
+
+                // Measure
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_phys = 0u64;
+                let mut sum_sched = 0u64;
+
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pipe_v3_pagesched(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &layout.adj_index,
+                        &mut perf, PerfLevel::EnableTime, 8,
+                    ).await;
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_phys += perf.phys_reads;
+                    sum_sched += perf.page_sched_hits;
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+                let nf = num_bench_queries as f64;
+
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+
+                eprintln!("{:>16} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                    format!("{}+B8", layout.label), mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_hit as f64 / nf,
+                    sum_phys as f64 / nf,
+                    sum_sched as f64 / nf);
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+        });
+    }) {
+        eprintln!("Skipped: io_uring not available");
+    }
+}
+
+/// Sensitivity sweep: heavy_edge vs BFS across pool_pages, W, ef.
+///
+/// Two passes per grid point:
+///   - perq-cold: pool.clear() each query (layout truth — phys/q tracks upg/q)
+///   - warm: disjoint warmup [300..320), then measure without clearing
+///
+/// W=0 is real no-prefetch (no worker spawned, prefetch_window=0).
+/// Pool sizes are explicit page counts (not %, which clamps to 256 at 100K).
+#[test]
+#[ignore] // EC2-only: BENCH_DIR + COHERE_DIR required
+fn exp_heavy_edge_sweep() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let num_bench_queries = 100;
+    let warmup_queries = 20;
+    let bench_start = 200;
+    let bench_end = bench_start + num_bench_queries;
+    let warmup_start = bench_end;
+    let warmup_end = warmup_start + warmup_queries;
+
+    assert!(nq >= warmup_end, "Need {} queries but dataset has {}", warmup_end, nq);
+
+    eprintln!("=== EXP-HEAVY-EDGE-SWEEP v2: Cohere {}K, dim={}, k={} ===", n / 1000, dim, k);
+
+    // Build NSW index
+    eprintln!("Building NSW index (n={}, m_max={}, ef_c={}) ...", n, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
+    let entry_set: Vec<VectorId> = index.entry_set().to_vec();
+
+    // Base dir
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let base_dir: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        base_dir = std::path::PathBuf::from(bd).join("he_sweep_v2");
+        std::fs::create_dir_all(&base_dir).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        base_dir = _tmpdir.path().to_path_buf();
+    }
+
+    // Write vectors.dat (shared)
+    let vec_dir = base_dir.clone();
+    let writer_base = IndexWriter::new(&vec_dir);
+    writer_base.write(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+    ).unwrap();
+    let disk_vectors = load_vectors(&vec_dir.join("vectors.dat"), n, dim).unwrap();
+
+    // BFS layout
+    eprintln!("Computing BFS reorder...");
+    let bfs_reorder_map = bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
+    let bfs_dir = base_dir.join("bfs");
+    std::fs::create_dir_all(&bfs_dir).unwrap();
+    let bfs_writer = IndexWriter::new(&bfs_dir);
+    bfs_writer.write_v3(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+        &bfs_reorder_map,
+        "bfs",
+    ).unwrap();
+    std::fs::copy(vec_dir.join("vectors.dat"), bfs_dir.join("vectors.dat")).unwrap();
+    let bfs_meta = IndexMeta::load_from(&bfs_dir.join("meta.json")).unwrap();
+    let bfs_num_pages = bfs_meta.num_pages.unwrap_or(0) as usize;
+    let bfs_adj_index = load_adj_index(&bfs_dir.join("adj_index.dat"), n).unwrap();
+    eprintln!("  BFS: {} pages", bfs_num_pages);
+
+    // Heavy-edge layout
+    eprintln!("Computing heavy_edge reorder...");
+    let t0 = std::time::Instant::now();
+    let he_reorder_map = heavy_edge_reorder_graph(n, |vid| index.neighbors(vid));
+    eprintln!("  heavy_edge reorder computed in {:.1}s", t0.elapsed().as_secs_f64());
+    let he_dir = base_dir.join("heavy_edge");
+    std::fs::create_dir_all(&he_dir).unwrap();
+    let he_writer = IndexWriter::new(&he_dir);
+    he_writer.write_v3(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+        &he_reorder_map,
+        "heavy_edge",
+    ).unwrap();
+    std::fs::copy(vec_dir.join("vectors.dat"), he_dir.join("vectors.dat")).unwrap();
+    let he_meta = IndexMeta::load_from(&he_dir.join("meta.json")).unwrap();
+    let he_num_pages = he_meta.num_pages.unwrap_or(0) as usize;
+    let he_adj_index = load_adj_index(&he_dir.join("adj_index.dat"), n).unwrap();
+    eprintln!("  heavy_edge: {} pages", he_num_pages);
+
+    // Queries
+    let all_query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(warmup_end).map(|c| c.to_vec()).collect();
+    let bench_queries = &all_query_vecs[bench_start..bench_end];
+    let bench_gt = &ground_truth[bench_start..bench_end];
+    let warmup_query_slice = &all_query_vecs[warmup_start..warmup_end];
+
+    let bfs_dir_str = bfs_dir.to_str().unwrap().to_owned();
+    let he_dir_str = he_dir.to_str().unwrap().to_owned();
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // Sweep grid — explicit pool sizes (not %, which clamps at 100K)
+            let pool_page_counts = [256usize, 512, 1024];
+            let ws = [0usize, 2, 4, 8];
+            let efs = [150usize, 200, 250];
+
+            // ===== Pass 1: Per-query cold (layout truth) =====
+            eprintln!("\n--- Per-query cold (pool.clear() each query) ---");
+            eprintln!("{:>6} {:>3} {:>2} {:>4} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "pool", "ef", "W", "lay", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "miss/q", "hit/q", "phys/q");
+            eprintln!("{}", "-".repeat(100));
+
+            for &pool_pg in &pool_page_counts {
+                for &ef in &efs {
+                    for &w in &ws {
+                        for (label, adj_index_ref, dir_str) in [
+                            ("BFS", &bfs_adj_index[..], bfs_dir_str.as_str()),
+                            ("HE", &he_adj_index[..], he_dir_str.as_str()),
+                        ] {
+                            let io = Rc::new(
+                                IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                                    .await
+                                    .expect("failed to open IO driver"),
+                            );
+                            let pool_bytes = pool_pg * 4096;
+                            let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+
+                            // W=0: no prefetch worker, prefetch_window=0
+                            let handle = if w > 0 {
+                                Some(AdjacencyPool::spawn_prefetch_worker(
+                                    Rc::clone(&pool), Rc::clone(&io), w,
+                                ))
+                            } else {
+                                None
+                            };
+
+                            let mut recalls = Vec::with_capacity(num_bench_queries);
+                            let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                            let mut sum_exp = 0u64;
+                            let mut sum_miss = 0u64;
+                            let mut sum_hit = 0u64;
+                            let mut sum_phys = 0u64;
+
+                            let wall_start = std::time::Instant::now();
+                            for qi in 0..num_bench_queries {
+                                // Clear cache for cold measurement
+                                if w > 0 {
+                                    pool.pause_prefetch(true);
+                                    pool.drain_prefetch();
+                                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                                    while pool.has_loading() {
+                                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                                    }
+                                }
+                                pool.clear();
+                                if w > 0 {
+                                    pool.pause_prefetch(false);
+                                }
+
+                                let mut perf = SearchPerfContext::default();
+                                let t0 = std::time::Instant::now();
+                                let results = disk_graph_search_pipe_v3(
+                                    &bench_queries[qi], &entry_set, k, ef, w, 0, 0,
+                                    &pool, &io, &fp32_bank, adj_index_ref,
+                                    &mut perf, PerfLevel::EnableTime,
+                                ).await;
+                                latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                                let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                                recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                                sum_exp += perf.expansions;
+                                sum_miss += perf.blocks_miss;
+                                sum_hit += perf.blocks_hit;
+                                sum_phys += perf.phys_reads;
+                            }
+                            let wall_secs = wall_start.elapsed().as_secs_f64();
+                            let nf = num_bench_queries as f64;
+
+                            let mean_recall = recalls.iter().sum::<f64>() / nf;
+                            let qps = nf / wall_secs;
+                            let mut sorted_lat = latencies_ms.clone();
+                            sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            let p50 = percentile(&sorted_lat, 50.0);
+                            let p99 = percentile(&sorted_lat, 99.0);
+
+                            eprintln!("{:>6} {:>3} {:>2} {:>4} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                                pool_pg, ef, w, label, mean_recall, p50, p99, qps,
+                                sum_exp as f64 / nf,
+                                sum_miss as f64 / nf,
+                                sum_hit as f64 / nf,
+                                sum_phys as f64 / nf);
+
+                            pool.stop_prefetch();
+                            if let Some(h) = handle {
+                                h.await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ===== Pass 2: Warm (disjoint warmup, then measure) =====
+            eprintln!("\n--- Warm (warmup [{}..{}), measure [{}..{})) ---",
+                warmup_start, warmup_end, bench_start, bench_end);
+            eprintln!("{:>6} {:>3} {:>2} {:>4} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "pool", "ef", "W", "lay", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "miss/q", "hit/q", "phys/q");
+            eprintln!("{}", "-".repeat(100));
+
+            for &pool_pg in &pool_page_counts {
+                for &ef in &efs {
+                    for &w in &ws {
+                        for (label, adj_index_ref, dir_str) in [
+                            ("BFS", &bfs_adj_index[..], bfs_dir_str.as_str()),
+                            ("HE", &he_adj_index[..], he_dir_str.as_str()),
+                        ] {
+                            let io = Rc::new(
+                                IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                                    .await
+                                    .expect("failed to open IO driver"),
+                            );
+                            let pool_bytes = pool_pg * 4096;
+                            let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+
+                            let handle = if w > 0 {
+                                Some(AdjacencyPool::spawn_prefetch_worker(
+                                    Rc::clone(&pool), Rc::clone(&io), w,
+                                ))
+                            } else {
+                                None
+                            };
+
+                            // Warmup on disjoint queries
+                            for q in warmup_query_slice {
+                                let mut perf = SearchPerfContext::default();
+                                disk_graph_search_pipe_v3(
+                                    q, &entry_set, k, ef, w, 0, 0,
+                                    &pool, &io, &fp32_bank, adj_index_ref,
+                                    &mut perf, PerfLevel::CountOnly,
+                                ).await;
+                            }
+
+                            // Measure (no clear between queries)
+                            let mut recalls = Vec::with_capacity(num_bench_queries);
+                            let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                            let mut sum_exp = 0u64;
+                            let mut sum_miss = 0u64;
+                            let mut sum_hit = 0u64;
+                            let mut sum_phys = 0u64;
+
+                            let wall_start = std::time::Instant::now();
+                            for qi in 0..num_bench_queries {
+                                let mut perf = SearchPerfContext::default();
+                                let t0 = std::time::Instant::now();
+                                let results = disk_graph_search_pipe_v3(
+                                    &bench_queries[qi], &entry_set, k, ef, w, 0, 0,
+                                    &pool, &io, &fp32_bank, adj_index_ref,
+                                    &mut perf, PerfLevel::EnableTime,
+                                ).await;
+                                latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                                let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                                recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                                sum_exp += perf.expansions;
+                                sum_miss += perf.blocks_miss;
+                                sum_hit += perf.blocks_hit;
+                                sum_phys += perf.phys_reads;
+                            }
+                            let wall_secs = wall_start.elapsed().as_secs_f64();
+                            let nf = num_bench_queries as f64;
+
+                            let mean_recall = recalls.iter().sum::<f64>() / nf;
+                            let qps = nf / wall_secs;
+                            let mut sorted_lat = latencies_ms.clone();
+                            sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            let p50 = percentile(&sorted_lat, 50.0);
+                            let p99 = percentile(&sorted_lat, 99.0);
+
+                            eprintln!("{:>6} {:>3} {:>2} {:>4} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                                pool_pg, ef, w, label, mean_recall, p50, p99, qps,
+                                sum_exp as f64 / nf,
+                                sum_miss as f64 / nf,
+                                sum_hit as f64 / nf,
+                                sum_phys as f64 / nf);
+
+                            pool.stop_prefetch();
+                            if let Some(h) = handle {
+                                h.await;
+                            }
+                        }
+                    }
+                }
             }
         });
     }) {
