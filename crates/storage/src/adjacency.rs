@@ -620,6 +620,152 @@ pub fn heavy_edge_reorder_graph<'a>(
     old_to_new
 }
 
+/// Affinity co-placement reorder (VeloANN-inspired): seed pages with high-degree nodes,
+/// greedily fill from graph neighbors maximizing the number of shared edges with
+/// already-placed page members.
+///
+/// Unlike `heavy_edge_reorder_graph` which weights edges by `indeg(u)+indeg(v)`,
+/// this uses raw edge count to page members as the affinity score. The intuition:
+/// during beam search, expanding node X often leads to expanding X's neighbors next.
+/// If X and its neighbors share a page, those follow-up expansions are cache hits.
+///
+/// Returns `old_to_new` mapping (same contract as `bfs_reorder_graph`).
+pub fn affinity_reorder_graph<'a>(
+    n: usize,
+    neighbors_fn: impl Fn(u32) -> &'a [u32],
+) -> Vec<u32> {
+    if n == 0 {
+        return vec![];
+    }
+
+    // Precompute sorted neighbor lists and record sizes
+    let nbr_sorted: Vec<Vec<u32>> = (0..n)
+        .map(|u| {
+            let mut v: Vec<u32> = neighbors_fn(u as u32)
+                .iter()
+                .copied()
+                .filter(|&vid| (vid as usize) < n)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        })
+        .collect();
+
+    let rec_sizes: Vec<usize> = (0..n)
+        .map(|u| packed_record_size(neighbors_fn(u as u32).len()))
+        .collect();
+
+    // Sort VIDs by degree descending (high-degree = good page seed)
+    let mut vids_by_degree: Vec<u32> = (0..n as u32).collect();
+    vids_by_degree.sort_unstable_by(|&a, &b| {
+        nbr_sorted[b as usize].len().cmp(&nbr_sorted[a as usize].len()).then(a.cmp(&b))
+    });
+
+    let mut old_to_new = vec![u32::MAX; n];
+    let mut assigned = vec![false; n];
+    let mut next_id = 0u32;
+    let page_size = BLOCK_SIZE;
+
+    // Stamp array for O(1) dedup per round
+    let mut seen_round: Vec<u32> = vec![0; n];
+    let mut round: u32 = 0;
+
+    for &seed in &vids_by_degree {
+        if assigned[seed as usize] {
+            continue;
+        }
+
+        let seed_rec = rec_sizes[seed as usize];
+        if seed_rec > page_size {
+            old_to_new[seed as usize] = next_id;
+            next_id += 1;
+            assigned[seed as usize] = true;
+            continue;
+        }
+
+        // Start a new page with this seed
+        let mut page_members: Vec<u32> = Vec::new();
+        let mut page_used = 0usize;
+
+        old_to_new[seed as usize] = next_id;
+        next_id += 1;
+        assigned[seed as usize] = true;
+        page_members.push(seed);
+        page_used += seed_rec;
+
+        // Greedily fill: pick the unassigned neighbor with the most edges
+        // (raw count) to existing page members.
+        loop {
+            let mut best_vid = u32::MAX;
+            let mut best_affinity = 0u32;
+            let mut best_degree = 0usize;
+
+            if round == u32::MAX {
+                seen_round.fill(0);
+                round = 1;
+            } else {
+                round += 1;
+            }
+
+            for &m in &page_members {
+                for &nbr in &nbr_sorted[m as usize] {
+                    if assigned[nbr as usize] {
+                        continue;
+                    }
+                    if seen_round[nbr as usize] == round {
+                        continue;
+                    }
+                    seen_round[nbr as usize] = round;
+
+                    if page_used + rec_sizes[nbr as usize] > page_size {
+                        continue;
+                    }
+
+                    // Affinity = count of edges to page members
+                    let cand_nbrs = &nbr_sorted[nbr as usize];
+                    let mut affinity = 0u32;
+                    for &pm in &page_members {
+                        if cand_nbrs.binary_search(&pm).is_ok() {
+                            affinity += 1;
+                        }
+                    }
+
+                    let deg = cand_nbrs.len();
+                    if affinity > best_affinity
+                        || (affinity == best_affinity && deg > best_degree)
+                        || (affinity == best_affinity && deg == best_degree && nbr < best_vid)
+                    {
+                        best_affinity = affinity;
+                        best_vid = nbr;
+                        best_degree = deg;
+                    }
+                }
+            }
+
+            if best_vid == u32::MAX {
+                break;
+            }
+
+            old_to_new[best_vid as usize] = next_id;
+            next_id += 1;
+            assigned[best_vid as usize] = true;
+            page_members.push(best_vid);
+            page_used += rec_sizes[best_vid as usize];
+        }
+    }
+
+    // Remaining unassigned nodes
+    for i in 0..n {
+        if old_to_new[i] == u32::MAX {
+            old_to_new[i] = next_id;
+            next_id += 1;
+        }
+    }
+
+    old_to_new
+}
+
 /// Byte size of one adjacency record in v3 packed format.
 /// 2 bytes (degree u16) + 4 bytes per neighbor VID (u32).
 /// Used by both the writer and the TWPP packer for consistent sizing.

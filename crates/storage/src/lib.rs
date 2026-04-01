@@ -8,8 +8,8 @@ pub use adjacency::{
     decode_adj_block, decode_adj_block_view, encode_adj_block, encode_adj_block_v2,
     max_degree_v2, write_adjacency_file_v2, AdjBlockView, BLOCK_SIZE,
     // v3: page-packed adjacency
-    AdjIndexEntry, bfs_reorder_graph, heavy_edge_reorder_graph, load_adj_index,
-    neighbor_run_reorder_graph, packed_record_size, page_record_vid,
+    AdjIndexEntry, affinity_reorder_graph, bfs_reorder_graph, heavy_edge_reorder_graph,
+    load_adj_index, neighbor_run_reorder_graph, packed_record_size, page_record_vid,
     twpp_reorder_graph, write_packed_adjacency,
 };
 pub use meta::IndexMeta;

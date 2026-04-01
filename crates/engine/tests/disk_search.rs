@@ -26,8 +26,8 @@ use divergence_engine::{
 use divergence_index::{NswBuilder, NswConfig};
 use divergence_storage::{
     load_vectors, write_vectors_fp16_file, write_vectors_int8_file, IndexMeta, IndexWriter,
-    AdjIndexEntry, bfs_reorder_graph, heavy_edge_reorder_graph, load_adj_index,
-    neighbor_run_reorder_graph, twpp_reorder_graph,
+    AdjIndexEntry, affinity_reorder_graph, bfs_reorder_graph, heavy_edge_reorder_graph,
+    load_adj_index, neighbor_run_reorder_graph, twpp_reorder_graph,
 };
 
 use rand::Rng;
@@ -8543,6 +8543,7 @@ fn exp_saq_graph() {
     let layout_specs: Vec<(&str, Vec<u32>)> = vec![
         ("bfs", bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid))),
         ("heavy_edge", heavy_edge_reorder_graph(n, |vid| index.neighbors(vid))),
+        ("affinity", affinity_reorder_graph(n, |vid| index.neighbors(vid))),
     ];
     let mut v3_layouts: Vec<V3Layout> = Vec::new();
     for (label, reorder) in &layout_specs {
