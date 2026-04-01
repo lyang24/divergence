@@ -26,8 +26,8 @@ use divergence_engine::{
 use divergence_index::{NswBuilder, NswConfig};
 use divergence_storage::{
     load_vectors, write_vectors_fp16_file, write_vectors_int8_file, IndexMeta, IndexWriter,
-    AdjIndexEntry, affinity_reorder_graph, bfs_reorder_graph, heavy_edge_reorder_graph,
-    load_adj_index, neighbor_run_reorder_graph, twpp_reorder_graph,
+    AdjIndexEntry, affinity_reorder_graph, bfs_reorder_graph, graphago_reorder_graph,
+    heavy_edge_reorder_graph, load_adj_index, neighbor_run_reorder_graph, twpp_reorder_graph,
 };
 
 use rand::Rng;
@@ -10398,6 +10398,347 @@ fn exp_heavy_edge_sweep() {
                         }
                     }
                 }
+            }
+        });
+    }) {
+        eprintln!("Skipped: io_uring not available");
+    }
+}
+
+// ─── GraphAGO Activity-Neighborhood Ordering Experiment ──────────────────────
+
+#[test]
+#[ignore] // EC2-only: BENCH_DIR + COHERE_DIR required
+fn exp_graphago() {
+    let max_n: usize = std::env::var("COHERE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let dataset_dir = std::env::var("COHERE_DIR").unwrap_or_else(|_| {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        format!("{}/../../data/cohere_100k", manifest)
+    });
+
+    let (vectors, queries_flat, ground_truth, n, nq, dim, k) =
+        match load_cohere_dataset(&dataset_dir, max_n) {
+            Some(d) => d,
+            None => return,
+        };
+
+    let m_max = 32;
+    let ef_construction = 200;
+    let ef = 200;
+    let prefetch_width = 4;
+    let num_trace_queries = 200;
+    let num_bench_queries = 100;
+    let warmup_queries = 20;
+    let cache_pct = 5usize;
+
+    let bench_start = num_trace_queries;
+    let bench_end = bench_start + num_bench_queries;
+    let warmup_start = bench_end;
+    let warmup_end = warmup_start + warmup_queries;
+    let total_queries_needed = warmup_end;
+
+    assert!(nq >= total_queries_needed,
+        "Need {} queries but dataset has {}", total_queries_needed, nq);
+
+    eprintln!("=== EXP-GRAPHAGO: Cohere {}K, dim={}, k={}, ef={} ===",
+        n / 1000, dim, k, ef);
+
+    // 1. Build NSW index
+    eprintln!("Building NSW index (n={}, m_max={}, ef_c={}) ...", n, m_max, ef_construction);
+    let t0 = std::time::Instant::now();
+    let config = NswConfig::new(m_max, ef_construction);
+    let builder = NswBuilder::new(config, dim, MetricType::Cosine, n);
+    for (i, v) in vectors.chunks_exact(dim).enumerate() {
+        builder.insert(VectorId(i as u32), v);
+    }
+    let index = builder.build();
+    eprintln!("  Index built in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let entry_ids: Vec<u32> = index.entry_set().iter().map(|v| v.0).collect();
+    let entry_set: Vec<VectorId> = index.entry_set().to_vec();
+
+    // 2. Compute in-degree (fallback activity metric)
+    let mut indeg = vec![0u32; n];
+    for u in 0..n {
+        for &v in index.neighbors(u as u32) {
+            if (v as usize) < n {
+                indeg[v as usize] += 1;
+            }
+        }
+    }
+    let indeg_activity: Vec<f64> = indeg.iter().map(|&d| d as f64).collect();
+
+    // 3. Setup directories
+    let bench_dir = std::env::var("BENCH_DIR").ok();
+    let direct_io = bench_dir.is_some();
+    let _tmpdir;
+    let base_dir: std::path::PathBuf;
+    if let Some(ref bd) = bench_dir {
+        base_dir = std::path::PathBuf::from(bd).join("graphago");
+        std::fs::create_dir_all(&base_dir).unwrap();
+    } else {
+        _tmpdir = tempfile::tempdir().unwrap();
+        base_dir = _tmpdir.path().to_path_buf();
+    }
+
+    // Write vectors.dat
+    let vec_dir = base_dir.clone();
+    let writer_base = IndexWriter::new(&vec_dir);
+    writer_base.write(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+    ).unwrap();
+    let disk_vectors = load_vectors(&vec_dir.join("vectors.dat"), n, dim).unwrap();
+
+    // 4. Build BFS layout (needed for trace collection)
+    let bfs_dir = base_dir.join("bfs");
+    std::fs::create_dir_all(&bfs_dir).unwrap();
+    let bfs_reorder = bfs_reorder_graph(n, &entry_ids, |vid| index.neighbors(vid));
+    let bfs_writer = IndexWriter::new(&bfs_dir);
+    bfs_writer.write_v3(
+        n as u32, dim, "cosine", index.max_degree(), ef_construction,
+        &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+        &bfs_reorder, "bfs",
+    ).unwrap();
+    std::fs::copy(vec_dir.join("vectors.dat"), bfs_dir.join("vectors.dat")).unwrap();
+    let bfs_meta = IndexMeta::load_from(&bfs_dir.join("meta.json")).unwrap();
+    let bfs_num_pages = bfs_meta.num_pages.unwrap_or(0) as usize;
+    let bfs_adj_index = load_adj_index(&bfs_dir.join("adj_index.dat"), n).unwrap();
+    eprintln!("  BFS layout: {} pages", bfs_num_pages);
+
+    // Query slices
+    let all_query_vecs: Vec<Vec<f32>> = queries_flat
+        .chunks_exact(dim).take(total_queries_needed).map(|c| c.to_vec()).collect();
+    let trace_queries = &all_query_vecs[0..num_trace_queries];
+    let bench_queries = &all_query_vecs[bench_start..bench_end];
+    let bench_gt = &ground_truth[bench_start..bench_end];
+
+    let bfs_dir_str = bfs_dir.to_str().unwrap().to_owned();
+
+    if !with_runtime(|rt| {
+        rt.block_on(async {
+            let fp32_bank = FP32SimdVectorBank::new(&disk_vectors, dim, MetricType::Cosine);
+
+            // 5. Collect traces on BFS layout (cold, queries [0..200))
+            eprintln!("\n--- Phase 1: Trace collection ({} queries, cold, BFS layout) ---",
+                num_trace_queries);
+            let mut trace_recorder = TraceRecorder::with_capacity(n, n * 4);
+
+            {
+                let io = Rc::new(
+                    IoDriver::open_pages(&bfs_dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let trace_pool_pages = (bfs_num_pages * cache_pct / 100).max(256);
+                let trace_pool_bytes = trace_pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(trace_pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                for qi in 0..num_trace_queries {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    disk_graph_search_pipe_v3_traced(
+                        &trace_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &bfs_adj_index,
+                        &mut perf, PerfLevel::CountOnly, &mut trace_recorder,
+                    ).await;
+                }
+
+                pool.stop_prefetch();
+                handle.await;
+            }
+
+            let total_expansions: u64 = trace_recorder.node_counts.values()
+                .map(|&c| c as u64).sum();
+            let unique_expanded = trace_recorder.node_counts.len();
+            eprintln!("  Trace: {} unique VIDs expanded, {} total expansions",
+                unique_expanded, total_expansions);
+
+            // Build traced activity vector
+            let traced_activity: Vec<f64> = (0..n)
+                .map(|v| trace_recorder.node_counts.get(&(v as u32)).copied().unwrap_or(0) as f64)
+                .collect();
+
+            // 6. Build all layouts
+            eprintln!("\n--- Phase 2: Build layouts ---");
+            let hub_count = (n / 1000).max(1);
+            eprintln!("  hub_count = {} (n/1000)", hub_count);
+
+            let t0 = std::time::Instant::now();
+            let he_reorder = heavy_edge_reorder_graph(n, |vid| index.neighbors(vid));
+            eprintln!("  heavy_edge reorder: {:.1}s", t0.elapsed().as_secs_f64());
+
+            let t0 = std::time::Instant::now();
+            let ago_deg_reorder = graphago_reorder_graph(
+                n, |vid| index.neighbors(vid), &indeg_activity, hub_count,
+            );
+            eprintln!("  graphago_degree reorder: {:.1}s", t0.elapsed().as_secs_f64());
+
+            let t0 = std::time::Instant::now();
+            let ago_trace_reorder = graphago_reorder_graph(
+                n, |vid| index.neighbors(vid), &traced_activity, hub_count,
+            );
+            eprintln!("  graphago_traced reorder: {:.1}s", t0.elapsed().as_secs_f64());
+
+            // Write layouts
+            struct LayoutInfo {
+                label: &'static str,
+                dir: std::path::PathBuf,
+                num_pages: usize,
+                adj_index: Vec<AdjIndexEntry>,
+            }
+
+            let mut layouts: Vec<LayoutInfo> = Vec::new();
+
+            // BFS already built
+            layouts.push(LayoutInfo {
+                label: "bfs",
+                dir: bfs_dir.clone(),
+                num_pages: bfs_num_pages,
+                adj_index: bfs_adj_index.clone(),
+            });
+
+            for (label, reorder) in [
+                ("heavy_edge", &he_reorder),
+                ("ago_degree", &ago_deg_reorder),
+                ("ago_traced", &ago_trace_reorder),
+            ] {
+                let layout_dir = base_dir.join(label);
+                std::fs::create_dir_all(&layout_dir).unwrap();
+                let w = IndexWriter::new(&layout_dir);
+                w.write_v3(
+                    n as u32, dim, "cosine", index.max_degree(), ef_construction,
+                    &entry_ids, index.vectors_raw(), |vid| index.neighbors(vid),
+                    reorder, label,
+                ).unwrap();
+                std::fs::copy(vec_dir.join("vectors.dat"), layout_dir.join("vectors.dat")).unwrap();
+                let meta = IndexMeta::load_from(&layout_dir.join("meta.json")).unwrap();
+                let np = meta.num_pages.unwrap_or(0) as usize;
+                let ai = load_adj_index(&layout_dir.join("adj_index.dat"), n).unwrap();
+                eprintln!("  {}: {} pages", label, np);
+                layouts.push(LayoutInfo { label, dir: layout_dir, num_pages: np, adj_index: ai });
+            }
+
+            // 7. Benchmark all layouts (cold per query)
+            eprintln!("\n--- Phase 3: Cold benchmark ({} queries [{}..{})) ---",
+                num_bench_queries, bench_start, bench_end);
+            eprintln!("{:>14} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+                "layout", "recall", "p50ms", "p99ms", "QPS",
+                "exp/q", "blk/q", "mis/q", "hit/q", "phy/q", "upg/q");
+
+            for layout in &layouts {
+                let dir_str = layout.dir.to_str().unwrap();
+                let io = Rc::new(
+                    IoDriver::open_pages(dir_str, dim, 64, direct_io)
+                        .await
+                        .expect("failed to open IO driver"),
+                );
+                let pool_pages = (layout.num_pages * cache_pct / 100).max(256);
+                let pool_bytes = pool_pages * 4096;
+                let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                let handle = AdjacencyPool::spawn_prefetch_worker(
+                    Rc::clone(&pool), Rc::clone(&io), prefetch_width,
+                );
+
+                let mut recalls = Vec::with_capacity(num_bench_queries);
+                let mut latencies_ms = Vec::with_capacity(num_bench_queries);
+                let mut sum_exp = 0u64;
+                let mut sum_blk = 0u64;
+                let mut sum_miss = 0u64;
+                let mut sum_hit = 0u64;
+                let mut sum_phys = 0u64;
+
+                // Cold benchmark
+                let wall_start = std::time::Instant::now();
+                for qi in 0..num_bench_queries {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    let t0 = std::time::Instant::now();
+                    let results = disk_graph_search_pipe_v3(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &layout.adj_index,
+                        &mut perf, PerfLevel::EnableTime,
+                    ).await;
+                    latencies_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+
+                    let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                    recalls.push(recall_at_k(&ids, &bench_gt[qi]));
+
+                    sum_exp += perf.expansions;
+                    sum_blk += perf.blocks_read;
+                    sum_miss += perf.blocks_miss;
+                    sum_hit += perf.blocks_hit;
+                    sum_phys += perf.phys_reads;
+                }
+                let wall_secs = wall_start.elapsed().as_secs_f64();
+
+                // Unique pages measurement (traced, small sample)
+                let upq_sample = num_bench_queries.min(50);
+                let mut sum_upq = 0u64;
+                for qi in 0..upq_sample {
+                    pool.pause_prefetch(true);
+                    pool.drain_prefetch();
+                    monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    while pool.has_loading() {
+                        monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    }
+                    pool.clear();
+                    pool.pause_prefetch(false);
+
+                    let mut perf = SearchPerfContext::default();
+                    let mut qt = TraceRecorder::new();
+                    disk_graph_search_pipe_v3_traced(
+                        &bench_queries[qi], &entry_set, k, ef, prefetch_width, 0, 0,
+                        &pool, &io, &fp32_bank, &layout.adj_index,
+                        &mut perf, PerfLevel::CountOnly, &mut qt,
+                    ).await;
+                    let expanded: Vec<u32> = qt.node_counts.keys().copied().collect();
+                    sum_upq += unique_pages_for_query(&expanded, &layout.adj_index) as u64;
+                }
+
+                let nf = num_bench_queries as f64;
+                let mean_recall = recalls.iter().sum::<f64>() / nf;
+                let qps = nf / wall_secs;
+                let mut sorted_lat = latencies_ms.clone();
+                sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let p50 = percentile(&sorted_lat, 50.0);
+                let p99 = percentile(&sorted_lat, 99.0);
+                let upq = sum_upq as f64 / upq_sample as f64;
+
+                eprintln!("{:>14} {:>7.3} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1}",
+                    layout.label, mean_recall, p50, p99, qps,
+                    sum_exp as f64 / nf,
+                    sum_blk as f64 / nf,
+                    sum_miss as f64 / nf,
+                    sum_hit as f64 / nf,
+                    sum_phys as f64 / nf,
+                    upq);
+
+                pool.stop_prefetch();
+                handle.await;
             }
         });
     }) {

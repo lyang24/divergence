@@ -766,6 +766,88 @@ pub fn affinity_reorder_graph<'a>(
     old_to_new
 }
 
+/// GraphAGO Activity-Neighborhood graph ordering (SC'25, Xu et al.)
+///
+/// Two-phase algorithm:
+/// 1. Top `hub_count` vertices by activity get consecutive IDs at the front
+/// 2. Remaining vertices ordered by neighbor-run in activity-sorted order:
+///    iterate vertices by descending activity, eagerly assign each vertex's
+///    unassigned neighbors before continuing.
+///
+/// `activity` is a slice of length n, where `activity[vid]` is the activity
+/// score (higher = more active). Can be expansion counts from `TraceRecorder`
+/// or in-degree.
+/// `hub_count` controls how many top-activity vertices are packed together
+/// (paper uses |V|/1000).
+///
+/// Returns `old_to_new` mapping (same contract as `bfs_reorder_graph`).
+/// Complexity: O(|V| log |V| + |E|).
+pub fn graphago_reorder_graph<'a>(
+    n: usize,
+    neighbors_fn: impl Fn(u32) -> &'a [u32],
+    activity: &[f64],
+    hub_count: usize,
+) -> Vec<u32> {
+    assert_eq!(activity.len(), n);
+    if n == 0 {
+        return vec![];
+    }
+
+    // Sort VIDs by activity descending, break ties by VID ascending
+    let mut sorted_vids: Vec<u32> = (0..n as u32).collect();
+    sorted_vids.sort_unstable_by(|&a, &b| {
+        activity[b as usize]
+            .partial_cmp(&activity[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+
+    let mut old_to_new = vec![u32::MAX; n];
+    let mut visited = vec![false; n];
+    let mut next_id = 0u32;
+
+    // Phase 1: Hub assignment — top hub_count vertices get consecutive IDs
+    let hub_count = hub_count.min(n);
+    for &vid in sorted_vids.iter().take(hub_count) {
+        let vi = vid as usize;
+        if !visited[vi] {
+            old_to_new[vi] = next_id;
+            next_id += 1;
+            visited[vi] = true;
+        }
+    }
+
+    // Phase 2: Neighbor-run in activity-sorted order
+    for &vid in &sorted_vids {
+        let vi = vid as usize;
+        if !visited[vi] {
+            old_to_new[vi] = next_id;
+            next_id += 1;
+            visited[vi] = true;
+        }
+        // Eagerly assign unvisited neighbors (creates neighbor-runs)
+        for &nbr in neighbors_fn(vid) {
+            let ni = nbr as usize;
+            if ni < n && !visited[ni] {
+                old_to_new[ni] = next_id;
+                next_id += 1;
+                visited[ni] = true;
+            }
+        }
+    }
+
+    // Fallback: any remaining (shouldn't happen for connected graphs)
+    for i in 0..n {
+        if old_to_new[i] == u32::MAX {
+            old_to_new[i] = next_id;
+            next_id += 1;
+        }
+    }
+
+    debug_assert_eq!(next_id as usize, n);
+    old_to_new
+}
+
 /// Byte size of one adjacency record in v3 packed format.
 /// 2 bytes (degree u16) + 4 bytes per neighbor VID (u32).
 /// Used by both the writer and the TWPP packer for consistent sizing.
