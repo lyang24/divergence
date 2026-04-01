@@ -831,6 +831,9 @@ async fn disk_graph_search_pipe_v3_inner(
     let gating_enabled = gate_ratio < 1.0;
     let timing = level >= PerfLevel::EnableTime;
 
+    // Scratch buffer for SAQ gating – reused across expansions.
+    let mut gate_scratch: Vec<(f32, u32)> = Vec::new();
+
     let mut nearest = FixedCapacityHeap::new(ef);
     let mut candidates = CandidateHeap::new();
 
@@ -993,7 +996,7 @@ async fn disk_graph_search_pipe_v3_inner(
         if gating_enabled {
             // SAQ-gated path: score all unvisited neighbors, keep top-T.
             // Critical: do NOT mark visited until after gating decision.
-            let mut scratch: Vec<(f32, u32)> = Vec::new();
+            gate_scratch.clear();
 
             let dist_start = if timing { Some(Instant::now()) } else { None };
             for i in 0..(entry.degree as usize) {
@@ -1003,13 +1006,13 @@ async fn disk_graph_search_pipe_v3_inner(
                     continue;
                 }
                 let d = bank.distance(query, nbr_idx);
-                scratch.push((d, nbr_raw));
+                gate_scratch.push((d, nbr_raw));
             }
             if let Some(s) = dist_start {
                 perf.dist_ns += s.elapsed().as_nanos() as u64;
             }
 
-            let scored_count = scratch.len();
+            let scored_count = gate_scratch.len();
             perf.distance_computes += scored_count as u64;
             perf.pq_candidates_scored += scored_count as u64;
 
@@ -1018,13 +1021,13 @@ async fn disk_graph_search_pipe_v3_inner(
             let t = t.max(gate_min).min(scored_count);
 
             if t < scored_count {
-                scratch.select_nth_unstable_by(t, |a, b| a.0.total_cmp(&b.0));
+                gate_scratch.select_nth_unstable_by(t, |a, b| a.0.total_cmp(&b.0));
                 perf.pq_candidates_filtered += (scored_count - t) as u64;
             }
             perf.pq_candidates_passed += t.min(scored_count) as u64;
 
             // Push only the top-T neighbors
-            for &(d, nbr_raw) in scratch.iter().take(t) {
+            for &(d, nbr_raw) in gate_scratch.iter().take(t) {
                 let nbr_idx = nbr_raw as usize;
                 visited[nbr_idx] = true;
 
