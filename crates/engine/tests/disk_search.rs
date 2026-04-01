@@ -16,7 +16,8 @@ use divergence_engine::{
     disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
     disk_graph_search_pipe_v3_pagesched,
     disk_graph_search_pipe_v3_refine, disk_graph_search_pipe_v3_refine_3stage,
-    disk_graph_search_pipe_v3_refine_fp16, disk_graph_search_pipe_v3_refine_int8,
+    disk_graph_search_pipe_v3_refine_fp16, disk_graph_search_pipe_v3_refine_fp16_gated,
+    disk_graph_search_pipe_v3_refine_int8,
     disk_graph_search_pipe_v3_traced,
     disk_graph_search_pq, disk_graph_search_refine,
     AdaEfParams, AdaEfStats, AdaEfTable, estimate_ada_ef,
@@ -8908,6 +8909,119 @@ fn exp_saq_graph() {
                         &layout.adj_index, &fp16_reader, &query_vecs, &ground_truth,
                     ).await;
                     print_bench_row(&cfg, &result);
+                    pool.stop_prefetch();
+                    handle.await;
+                }
+
+                // --- Stage 5b: SAQ Gating + FP16 refine (sweep gate_ratio) ---
+                eprintln!("\n=== SAQ Gating [{}]: sweep gate_ratio with FP16 refine R=160 (perq-cold) ===",
+                    layout.label);
+                eprintln!("  gate_min=4, measuring blk/q reduction at iso-recall");
+
+                for &gate_ratio in &[1.0f32, 0.75, 0.50, 0.33, 0.25] {
+                    let gate_min = 4usize;
+                    let refine_r = 160usize;
+                    let label = format!("gate{:.0}%+f16R{}", gate_ratio * 100.0, refine_r);
+                    let cfg = BenchConfig {
+                        label: label.clone(),
+                        ef: 200, k, prefetch_width: 4,
+                        stall_limit: 0, drain_budget: 0,
+                        adj_inflight: 64, cache_pct,
+                        num_queries, warmup_queries: 0,
+                        ada_ef: false,
+                        clear_per_query: true,
+                    };
+                    let pool = Rc::new(AdjacencyPool::new(pool_bytes));
+                    let handle = AdjacencyPool::spawn_prefetch_worker(
+                        Rc::clone(&pool), Rc::clone(&io), prefetch_budget,
+                    );
+
+                    let nq_gate = num_queries.min(query_vecs.len());
+                    let mut recalls = Vec::with_capacity(nq_gate);
+                    let mut latencies_ms = Vec::with_capacity(nq_gate);
+                    let mut sum_exp = 0u64;
+                    let mut sum_useful = 0u64;
+                    let mut sum_wasted = 0u64;
+                    let mut sum_blk = 0u64;
+                    let mut sum_gate_scored = 0u64;
+                    let mut sum_gate_passed = 0u64;
+                    let mut sum_gate_filtered = 0u64;
+                    let mut sum_dist_ns = 0u64;
+                    let mut sum_refine_bytes = 0u64;
+                    let mut sum_refine_ns = 0u64;
+                    let wall_start = std::time::Instant::now();
+
+                    for i in 0..nq_gate {
+                        pool.pause_prefetch(true);
+                        pool.drain_prefetch();
+                        monoio::time::sleep(std::time::Duration::from_micros(50)).await;
+                        while pool.has_loading() {
+                            monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                        }
+                        pool.clear();
+                        pool.pause_prefetch(false);
+
+                        let q = &query_vecs[i];
+                        let mut perf = SearchPerfContext::default();
+                        let t0 = std::time::Instant::now();
+
+                        let results = disk_graph_search_pipe_v3_refine_fp16_gated(
+                            q, &entry_set, k, 200, refine_r, 4,
+                            0, 0,
+                            &pool, &io, saq_bench_bank, &layout.adj_index,
+                            &fp16_reader,
+                            refine_inflight, &mut perf, PerfLevel::EnableTime,
+                            gate_ratio, gate_min,
+                        ).await;
+
+                        latencies_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                        let ids: Vec<u32> = results.iter().map(|s| s.id.0).collect();
+                        recalls.push(recall_at_k(&ids, &ground_truth[i]));
+
+                        sum_exp += perf.expansions;
+                        sum_useful += perf.useful_expansions;
+                        sum_wasted += perf.wasted_expansions;
+                        sum_blk += perf.blocks_read;
+                        sum_gate_scored += perf.pq_candidates_scored;
+                        sum_gate_passed += perf.pq_candidates_passed;
+                        sum_gate_filtered += perf.pq_candidates_filtered;
+                        sum_dist_ns += perf.dist_ns;
+                        sum_refine_bytes += perf.refine_bytes;
+                        sum_refine_ns += perf.refine_ns;
+                    }
+
+                    let wall_secs = wall_start.elapsed().as_secs_f64();
+                    let nf = nq_gate as f64;
+                    let mean_recall = recalls.iter().sum::<f64>() / nf;
+                    let qps = nf / wall_secs;
+                    let mut sorted_lat = latencies_ms.clone();
+                    sorted_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let p50 = percentile(&sorted_lat, 50.0);
+                    let p99 = percentile(&sorted_lat, 99.0);
+                    let ns_to_ms = 1.0 / 1_000_000.0;
+                    let gate_filter_pct = if sum_gate_scored > 0 {
+                        sum_gate_filtered as f64 / sum_gate_scored as f64 * 100.0
+                    } else { 0.0 };
+                    let waste_pct = if sum_exp > 0 {
+                        sum_wasted as f64 / sum_exp as f64 * 100.0
+                    } else { 0.0 };
+
+                    eprintln!(
+                        "  {:<20} recall={:.3}  blk/q={:.1}  p50={:.1}ms  p99={:.1}ms  QPS={:.1}  \
+                         exp/q={:.1}  waste%={:.1}  gate_scored/q={:.1}  gate_filtered%={:.1}  \
+                         dst_ms={:.2}  ref_ms={:.2}  ref_KB/q={:.0}",
+                        label, mean_recall,
+                        sum_blk as f64 / nf,
+                        p50, p99, qps,
+                        sum_exp as f64 / nf,
+                        waste_pct,
+                        sum_gate_scored as f64 / nf,
+                        gate_filter_pct,
+                        sum_dist_ns as f64 / nf * ns_to_ms,
+                        sum_refine_ns as f64 / nf * ns_to_ms,
+                        sum_refine_bytes as f64 / nf / 1024.0,
+                    );
+
                     pool.stop_prefetch();
                     handle.await;
                 }

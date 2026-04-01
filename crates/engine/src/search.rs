@@ -718,7 +718,7 @@ pub async fn disk_graph_search_pipe_v3(
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
-        pool, io, bank, adj_index, perf, level, None, 0,
+        pool, io, bank, adj_index, perf, level, None, 0, 1.0, 0,
     ).await
 }
 
@@ -742,7 +742,7 @@ pub async fn disk_graph_search_pipe_v3_traced(
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
-        pool, io, bank, adj_index, perf, level, Some(trace), 0,
+        pool, io, bank, adj_index, perf, level, Some(trace), 0, 1.0, 0,
     ).await
 }
 
@@ -771,7 +771,41 @@ pub async fn disk_graph_search_pipe_v3_pagesched(
 ) -> Vec<ScoredId> {
     disk_graph_search_pipe_v3_inner(
         query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
-        pool, io, bank, adj_index, perf, level, None, page_sched_b,
+        pool, io, bank, adj_index, perf, level, None, page_sched_b, 1.0, 0,
+    ).await
+}
+
+/// SAQ-gated variant of v3 search.
+///
+/// After SAQ-scoring all unvisited neighbors per expansion, keeps only the
+/// top-T (by SAQ distance) before pushing to the candidate heap.
+/// T = max(gate_min, ceil(degree × gate_ratio)).
+///
+/// Gated-out neighbors are NOT marked visited — they remain reachable via
+/// alternate paths in later expansions.
+///
+/// `gate_ratio = 1.0` is equivalent to the ungated baseline.
+pub async fn disk_graph_search_pipe_v3_gated(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+    gate_ratio: f32,
+    gate_min: usize,
+) -> Vec<ScoredId> {
+    disk_graph_search_pipe_v3_inner(
+        query, entry_set, k, ef, prefetch_window, stall_limit, drain_budget,
+        pool, io, bank, adj_index, perf, level, None, 0,
+        gate_ratio, gate_min,
     ).await
 }
 
@@ -791,7 +825,10 @@ async fn disk_graph_search_pipe_v3_inner(
     level: PerfLevel,
     mut trace: Option<&mut TraceRecorder>,
     page_sched_b: usize,
+    gate_ratio: f32,
+    gate_min: usize,
 ) -> Vec<ScoredId> {
+    let gating_enabled = gate_ratio < 1.0;
     let timing = level >= PerfLevel::EnableTime;
 
     let mut nearest = FixedCapacityHeap::new(ef);
@@ -952,36 +989,94 @@ async fn disk_graph_search_pipe_v3_inner(
         );
 
         let mut added_this_expansion = 0u32;
-        for i in 0..(entry.degree as usize) {
-            let nbr_raw = page_record_vid(page, &entry, i);
-            let nbr_idx = nbr_raw as usize;
-            if nbr_idx >= num_vectors || visited[nbr_idx] {
-                continue;
-            }
-            visited[nbr_idx] = true;
+
+        if gating_enabled {
+            // SAQ-gated path: score all unvisited neighbors, keep top-T.
+            // Critical: do NOT mark visited until after gating decision.
+            let mut scratch: Vec<(f32, u32)> = Vec::new();
 
             let dist_start = if timing { Some(Instant::now()) } else { None };
-            let d = bank.distance(query, nbr_idx);
+            for i in 0..(entry.degree as usize) {
+                let nbr_raw = page_record_vid(page, &entry, i);
+                let nbr_idx = nbr_raw as usize;
+                if nbr_idx >= num_vectors || visited[nbr_idx] {
+                    continue;
+                }
+                let d = bank.distance(query, nbr_idx);
+                scratch.push((d, nbr_raw));
+            }
             if let Some(s) = dist_start {
                 perf.dist_ns += s.elapsed().as_nanos() as u64;
             }
-            perf.distance_computes += 1;
 
-            let dominated = nearest.len() >= ef && d >= nearest.furthest().unwrap().distance;
-            if !dominated {
-                let scored = ScoredId {
-                    distance: d,
-                    id: VectorId(nbr_raw),
-                };
-                candidates.push(scored);
-                nearest.push(scored);
-                added_this_expansion += 1;
-                if entered_at[nbr_idx] == u32::MAX {
-                    entered_at[nbr_idx] = expansion_num as u32;
+            let scored_count = scratch.len();
+            perf.distance_computes += scored_count as u64;
+            perf.pq_candidates_scored += scored_count as u64;
+
+            // Gate to top-T by SAQ distance (ascending = best first)
+            let t = (scored_count as f32 * gate_ratio).ceil() as usize;
+            let t = t.max(gate_min).min(scored_count);
+
+            if t < scored_count {
+                scratch.select_nth_unstable_by(t, |a, b| a.0.total_cmp(&b.0));
+                perf.pq_candidates_filtered += (scored_count - t) as u64;
+            }
+            perf.pq_candidates_passed += t.min(scored_count) as u64;
+
+            // Push only the top-T neighbors
+            for &(d, nbr_raw) in scratch.iter().take(t) {
+                let nbr_idx = nbr_raw as usize;
+                visited[nbr_idx] = true;
+
+                let dominated = nearest.len() >= ef && d >= nearest.furthest().unwrap().distance;
+                if !dominated {
+                    let scored = ScoredId {
+                        distance: d,
+                        id: VectorId(nbr_raw),
+                    };
+                    candidates.push(scored);
+                    nearest.push(scored);
+                    added_this_expansion += 1;
+                    if entered_at[nbr_idx] == u32::MAX {
+                        entered_at[nbr_idx] = expansion_num as u32;
+                    }
+                    if !parent_of.is_empty() && parent_of[nbr_idx] == u32::MAX {
+                        parent_of[nbr_idx] = vid as u32;
+                    }
                 }
-                // Trace: record parent of this newly-pushed neighbor
-                if !parent_of.is_empty() && parent_of[nbr_idx] == u32::MAX {
-                    parent_of[nbr_idx] = vid as u32;
+            }
+        } else {
+            // Standard path: no gating, all neighbors scored and pushed.
+            for i in 0..(entry.degree as usize) {
+                let nbr_raw = page_record_vid(page, &entry, i);
+                let nbr_idx = nbr_raw as usize;
+                if nbr_idx >= num_vectors || visited[nbr_idx] {
+                    continue;
+                }
+                visited[nbr_idx] = true;
+
+                let dist_start = if timing { Some(Instant::now()) } else { None };
+                let d = bank.distance(query, nbr_idx);
+                if let Some(s) = dist_start {
+                    perf.dist_ns += s.elapsed().as_nanos() as u64;
+                }
+                perf.distance_computes += 1;
+
+                let dominated = nearest.len() >= ef && d >= nearest.furthest().unwrap().distance;
+                if !dominated {
+                    let scored = ScoredId {
+                        distance: d,
+                        id: VectorId(nbr_raw),
+                    };
+                    candidates.push(scored);
+                    nearest.push(scored);
+                    added_this_expansion += 1;
+                    if entered_at[nbr_idx] == u32::MAX {
+                        entered_at[nbr_idx] = expansion_num as u32;
+                    }
+                    if !parent_of.is_empty() && parent_of[nbr_idx] == u32::MAX {
+                        parent_of[nbr_idx] = vid as u32;
+                    }
                 }
             }
         }
@@ -1537,6 +1632,82 @@ pub async fn disk_graph_search_pipe_v3_refine_fp16(
     let candidates = disk_graph_search_pipe_v3(
         query, entry_set, refine_r, ef, prefetch_window,
         stall_limit, drain_budget, pool, io, cheap_bank, adj_index, perf, level,
+    )
+    .await;
+
+    // Stage 2: parallel FP16 vector reads + cosine rescore
+    let timing = level >= PerfLevel::EnableTime;
+    let refine_start = if timing { Some(Instant::now()) } else { None };
+
+    let norm_a: f32 = query.iter().map(|&x| x * x).sum();
+    let query_rc = Rc::new(query.to_vec());
+    let mut refined = Vec::with_capacity(candidates.len());
+    let mut total_refine_bytes = 0u64;
+
+    for batch in candidates.chunks(refine_inflight) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for &c in batch {
+            let vid = c.id.0;
+            let vr = Rc::clone(fp16_reader);
+            let q = Rc::clone(&query_rc);
+            let handle = monoio::spawn(async move {
+                match vr.read_cosine_distance(vid, &q, norm_a).await {
+                    Ok((dist, bytes_read)) => (ScoredId { distance: dist, id: c.id }, bytes_read),
+                    Err(_) => (c, 0),
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            let (scored, bytes) = h.await;
+            refined.push(scored);
+            total_refine_bytes += bytes as u64;
+        }
+    }
+
+    perf.refine_count = refined.len() as u64;
+    perf.refine_bytes = total_refine_bytes;
+
+    if let Some(start) = refine_start {
+        perf.refine_ns += start.elapsed().as_nanos() as u64;
+    }
+
+    refined.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+    refined.truncate(k);
+    refined
+}
+
+/// SAQ-gated FP16 refine: gated graph traversal → FP16 disk refine.
+///
+/// Same as `disk_graph_search_pipe_v3_refine_fp16` but with SAQ gating in stage 1.
+/// `gate_ratio` and `gate_min` control the gating behavior (see `disk_graph_search_pipe_v3_gated`).
+pub async fn disk_graph_search_pipe_v3_refine_fp16_gated(
+    query: &[f32],
+    entry_set: &[VectorId],
+    k: usize,
+    ef: usize,
+    refine_r: usize,
+    prefetch_window: usize,
+    stall_limit: u32,
+    drain_budget: u32,
+    pool: &AdjacencyPool,
+    io: &IoDriver,
+    cheap_bank: &dyn VectorBank,
+    adj_index: &[AdjIndexEntry],
+    fp16_reader: &std::rc::Rc<crate::io::Fp16VectorReader>,
+    refine_inflight: usize,
+    perf: &mut SearchPerfContext,
+    level: PerfLevel,
+    gate_ratio: f32,
+    gate_min: usize,
+) -> Vec<ScoredId> {
+    use std::rc::Rc;
+
+    // Stage 1: SAQ-gated graph traversal
+    let candidates = disk_graph_search_pipe_v3_gated(
+        query, entry_set, refine_r, ef, prefetch_window,
+        stall_limit, drain_budget, pool, io, cheap_bank, adj_index, perf, level,
+        gate_ratio, gate_min,
     )
     .await;
 

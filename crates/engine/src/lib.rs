@@ -24,8 +24,10 @@ pub use perf::{
 pub use runtime::{spawn_worker, WorkerConfig};
 pub use search::{
     disk_graph_search, disk_graph_search_exp, disk_graph_search_pipe, disk_graph_search_pipe_v3,
+    disk_graph_search_pipe_v3_gated,
     disk_graph_search_pipe_v3_refine, disk_graph_search_pipe_v3_refine_3stage,
-    disk_graph_search_pipe_v3_refine_fp16, disk_graph_search_pipe_v3_refine_int8,
+    disk_graph_search_pipe_v3_refine_fp16, disk_graph_search_pipe_v3_refine_fp16_gated,
+    disk_graph_search_pipe_v3_refine_int8,
     disk_graph_search_pipe_v3_pagesched, disk_graph_search_pipe_v3_traced,
     disk_graph_search_pq, disk_graph_search_refine,
     TraceRecorder,
